@@ -1,0 +1,2389 @@
+# Eltek Flatpack2 HE four-position shelf controller
+# Hardware: M5Stack Atom Lite + ATOMIC CANBus Base (CA-IS3050G)
+# CAN: 125 kbit/s, 29-bit extended identifiers
+# Project: https://github.com/ngustas/eltek-flatpack2-esphome
+# License: MIT. Based in part on the MIT-licensed taHC81 controller.
+#
+# EXPERIMENTAL POWER-CONTROL SOFTWARE. Read docs/INSTALLATION.md and change every
+# pack value before connecting a battery. Efficiency management starts disabled.
+# Bench probe/sniffer controls are included for diagnostics and must remain off
+# during normal operation.
+#
+# Shelf behavior:
+# - Discovers up to four rectifiers by serial number.
+# - Assigns CAN addresses 1..4 (login id 0x050048XX where XX = id * 4) and
+#   refreshes every login every five seconds; a PSU logs out ~15 s after the
+#   last login it receives, and then reverts to its stored default voltage.
+# - Treats "Shelf Current Limit" as the steady-state total requested shelf
+#   current and divides it equally over rectifiers that are actually carrying:
+#   recent status frames, not parked, and past their walk-in ramp. A unit
+#   still ramping is held out of the split so the incumbents keep their
+#   full share until the newcomer can take its portion.
+# - During that make-before-break interval the setpoint is still broadcast to
+#   every logged-in unit, so the aggregate current ceiling can temporarily be
+#   above the requested shelf limit. This deliberately prioritizes bus
+#   continuity over a hard current ceiling while a rectifier walks in.
+# - Sets output with the broadcast frame 0x05FF4004, the only set-output ID the
+#   rectifiers honour. Every logged-in unit therefore receives the same share.
+#   Per-unit set commands do not exist; login membership is the per-unit lever.
+# - A slot stops being re-logged-in once its rectifier goes quiet, so the unit's
+#   own login is allowed to lapse. Only then, after 30 seconds, may a different
+#   serial number reuse that CAN address.
+
+# ###########################################################################
+# ##                                                                       ##
+# ##   PACK VALUES - CHANGE EVERY ONE OF THESE BEFORE CONNECTING A PACK.   ##
+# ##                                                                       ##
+# ##   The figures below suit a 48 V / 16S LiFePO4 bank at 3.40 V/cell.    ##
+# ##   They are EXAMPLES, not safe defaults. A lead-acid string, a 15S      ##
+# ##   pack, or a different cell count needs different numbers throughout.  ##
+# ##   If you do not know what your pack's float and over-voltage figures   ##
+# ##   should be, stop and find out before connecting a rectifier to it.    ##
+# ##                                                                       ##
+# ###########################################################################
+substitutions:
+  # Normal output setpoint, and the initial value of each per-unit control.
+  float_voltage: '54.4'
+  # Over-voltage protection, sent with every setpoint frame.
+  ovp_voltage: '59.5'
+  # Written to rectifier EEPROM by an explicit button press. This is what a
+  # unit reverts to if it loses contact with this controller, so it sits below
+  # float on purpose: an unsupervised rectifier should idle, not charge.
+  fallback_voltage: '48.9'
+  # Bounds for every voltage control in the UI. Keep this window tight - it is
+  # the last thing standing between a mis-drag and your pack.
+  voltage_min: '43.70'
+  voltage_max: '57.60'
+  # TOTAL shelf current, divided across active rectifiers - NOT per unit.
+  # 15 A here is 7.5 A each with two rectifiers, 5 A each with three.
+  shelf_current: '15.0'
+
+  tx_pin: '22'
+  rx_pin: '19'
+  led_pin: '27'
+  name: m5stack-eltek-shelf
+  friendly_name: M5Stack Eltek Shelf
+
+  # A slot stops being re-logged-in after this long without activity, after
+  # which the rectifier's own login lapses (~12.8 s). address_reuse_ms must
+  # stay comfortably above login_grace_ms + 12800 so a replacement can never
+  # be handed an address a still-logged-in unit holds.
+  # Adoption of an already-logged-in rectifier waits this long after boot so
+  # that units which still announce themselves are discovered by serial first.
+  adopt_holdoff_ms: '20000'
+  login_grace_ms: '12000'
+  address_reuse_ms: '30000'
+
+  # How long a rectifier must be out of walk-in before it counts as carrying.
+  # Used by the current allocator and by the rotation readiness gate, which
+  # must agree or a hand-over could complete before the split has widened.
+  carry_settle_ms: '6000'
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  # channel_colors on esp32_rmt_led_strip replaced rgb_order in 2026.8.0.
+  # Older versions fail with an unhelpful unknown-key error.
+  min_version: 2026.8.0
+  on_boot:
+    # Enumeration prompt: 0x0500BC02 / 6D 30 00 makes every rectifier announce
+    # itself with its serial on 0x05XX4400, even while it is logged in. This is
+    # what a Smartpack sends on boot, and it is what stops a unit that was
+    # logged in before this controller restarted from going unidentified.
+    priority: -100
+    then:
+      - delay: 4s
+      - repeat:
+          count: 3
+          then:
+            - lambda: |-
+                if (id(observe_mode).state) {
+                  ESP_LOGI("eltek", "observe mode on - boot enumeration suppressed");
+                  return;
+                }
+                std::vector<uint8_t> prompt = {0x6D, 0x30, 0x00};
+                id(eltek).send_data(0x0500BC02, true, prompt);
+                ESP_LOGW("eltek", "sent enumeration prompt");
+            - delay: 1500ms
+
+esp32:
+  # Keep this literal: some Device Builder/PlatformIO paths can pass a board
+  # substitution through unexpanded, producing "No boards ... match ${board}".
+  board: m5stack-atom
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+
+logger:
+  baud_rate: 0
+  level: INFO
+
+api:
+  # This controller must keep maintaining rectifier logins if Home Assistant
+  # is offline. Network recovery must not reboot the power-control loop.
+  reboot_timeout: 0s
+  encryption:
+    key: !secret m5stack_eltek_can__encryption_key
+
+ota:
+  platform: esphome
+  password: !secret m5stack_eltek_can__ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  reboot_timeout: 0s
+
+globals:
+  # Serial/login payload assigned to logical rectifier slots 1..4.
+  - id: rectifier_serial
+    type: uint8_t[32]
+    restore_value: no
+    initial_value: '{0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0}'
+  - id: rectifier_valid
+    type: bool[4]
+    restore_value: no
+    initial_value: '{false, false, false, false}'
+  - id: rectifier_last_seen_ms
+    type: uint32_t[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+  - id: rectifier_last_heard_ms
+    type: uint32_t[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+  - id: rectifier_was_online
+    type: bool[4]
+    restore_value: no
+    initial_value: '{false, false, false, false}'
+  # Was this slot load-bearing (online and past its walk-in ramp) last tick?
+  # Distinct from rectifier_was_online, which tracks comms only and gates all
+  # the per-slot telemetry sensors.
+  - id: rectifier_was_carrying
+    type: bool[4]
+    restore_value: no
+    initial_value: '{false, false, false, false}'
+  # millis() when a slot last began carrying, for the settle hold below.
+  - id: carry_settle_ms
+    type: uint32_t[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+
+  # Serial staged by a discovery frame for register_rectifier to consume.
+  - id: pending_serial
+    type: uint8_t[8]
+    restore_value: no
+    initial_value: '{0,0,0,0,0,0,0,0}'
+
+  # Warning/alarm bit fields per slot, filled from 0x05XXBFFC responses.
+  - id: rectifier_warn_bits
+    type: uint16_t[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+  - id: rectifier_alarm_bits
+    type: uint16_t[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+  - id: rectifier_fault_query_ms
+    type: uint32_t[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+
+  # --- efficiency manager state ---
+  # park_target = what we want, park_active = what the rectifier has been told.
+  # A park is held by REPEATED keepalive (~4 s, as the Smartpack does), never
+  # latched: if this controller dies, every parked unit returns to service.
+  - id: park_target
+    type: bool[4]
+    restore_value: no
+    initial_value: '{false, false, false, false}'
+  - id: park_active
+    type: bool[4]
+    restore_value: no
+    initial_value: '{false, false, false, false}'
+  - id: park_last_send
+    type: uint32_t[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+  # Runtime accumulated since boot, in seconds. Authoritative totals live in HA
+  # (they must survive reflashes); this is the current session's addition, and
+  # it is what the Session Runtime sensors report.
+  - id: run_seconds
+    type: uint32_t[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+  # Value of run_seconds when Home Assistant last pushed a total for this slot.
+  # Rotation needs hours-since-that-push, NOT hours-since-boot: HA's accumulator
+  # runs every minute against the live rectifiers, so the total it sends already
+  # contains the session. Adding the whole session on top double-counted it -
+  # by 53 h and 72 h on a five-day uptime, nearly doubling both figures. The
+  # ordering happened to survive, but any unit whose share of the session
+  # differed from its share of lifetime hours was ranked wrongly.
+  - id: run_seconds_at_push
+    type: uint32_t[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+  # Available max output current per unit, amps, as ADVERTISED by the rectifier
+  # on 0x05XX9C00 selector 0x2301. 0 = not yet asked or not yet answered.
+  #
+  # This is not the nameplate figure and it is not constant. A Flatpack2 HE is
+  # input-current limited, so what it will actually deliver tracks the line
+  # voltage in real time. Measured on this shelf, both units agreeing:
+  #
+  #     117-118 VAC   ->   25.4 - 25.7 A
+  #     122 VAC       ->   26.7 - 26.9 A
+  #     244-246 VAC   ->   42.2 A
+  #
+  # So the same hardware gives 66% more current on 240 V, and the advertised
+  # value on high line exceeds the 41.7 A nameplate rather than approaching it
+  # from below. Anything that sizes the shelf must use this number and not a
+  # rating off the label: on 120 V a nameplate-based estimate is 64% high, which
+  # would size the shelf for a load it cannot carry.
+  #
+  # Cleared when a slot changes occupant, so a new unit is never credited with
+  # the previous one's capability before it has answered.
+  - id: unit_max_a
+    type: float[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+
+  # Smoothed shelf load. The manual sheds on AVERAGE load, not instantaneous -
+  # without this a load sitting near the threshold walks a rectifier in and out.
+  - id: load_avg
+    type: float
+    restore_value: no
+    initial_value: '0'
+  - id: shed_hold_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: shuffle_last_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # Set by the Shuffle Now button to trigger a rotation on the next tick.
+  - id: force_shuffle
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # 0 = idle, 1 = overlap in progress (incoming up, outgoing not yet parked)
+  - id: trans_phase
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # Slot being brought up during a rotation, so its readiness can be checked
+  # before the outgoing unit is parked. -1 when no rotation is in progress.
+  - id: trans_in
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: trans_out
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: trans_start_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # Reassembly buffer for the multi-frame serial-number read (0x05XXBC00).
+  - id: serial_asm
+    type: uint8_t[32]
+    restore_value: no
+    initial_value: '{0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0}'
+  - id: serial_asm_len
+    type: uint8_t[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+
+  # Slots adopted from status frames alone: the unit was already logged in when
+  # the controller restarted, so it never announces itself and its serial is
+  # unknown. Telemetry and the broadcast setpoint work regardless.
+  - id: rectifier_adopted
+    type: bool[4]
+    restore_value: no
+    initial_value: '{false, false, false, false}'
+
+  # Telemetry indexed by logical rectifier slot.
+  - id: rectifier_vin
+    type: float[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+  - id: rectifier_vout
+    type: float[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+  - id: rectifier_iout
+    type: float[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+  - id: rectifier_temp_inlet
+    type: int[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+  - id: rectifier_temp_outlet
+    type: int[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+  - id: rectifier_state
+    type: uint8_t[4]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0}'
+
+  # Shelf state calculated once per second.
+  - id: active_rectifier_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: discovered_rectifier_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: allocated_current_per_rectifier
+    type: float
+    restore_value: no
+    initial_value: '0'
+  - id: effective_shelf_current_limit
+    type: float
+    restore_value: no
+    initial_value: '0'
+
+canbus:
+  - platform: esp32_can
+    rx_pin: ${rx_pin}
+    tx_pin: ${tx_pin}
+    can_id: 1
+    id: eltek
+    use_extended_id: true
+    bit_rate: 125kbps
+    rx_queue_len: 64
+    tx_queue_len: 32
+    on_frame:
+      # Logged-out hello: 0x0500XXXX. Payload is 0x1B, six serial bytes, 0x00.
+      - can_id: 0x05000000
+        can_id_mask: 0x1FFF0000
+        use_extended_id: true
+        then:
+          - if:
+              # The guard lives in the condition, not in a lambda action: a
+              # bare `return` inside a lambda ends only that lambda, so the
+              # script would still run afterwards on a stale serial.
+              condition:
+                lambda: |-
+                  // 0x1B and 0x1C are both introduction frames; the Smartpack's
+                  // units were observed announcing with 0x1C. Rejecting it made
+                  // logged-in units look silent and left them undiscovered.
+                  if (x.size() < 8 || (x[0] != 0x1B && x[0] != 0x1C)) return false;
+                  for (int i = 0; i < 6; i++) id(pending_serial)[i] = x[i + 1];
+                  id(pending_serial)[6] = 0;
+                  id(pending_serial)[7] = 0;
+                  return true;
+              then:
+                - script.execute:
+                    id: register_rectifier
+                    source: "New rectifier seen"
+
+      # Login request/start-up notification: 0x05XX4400. Unlike the hello
+      # frame, its payload is already the six serial bytes followed by zeros.
+      - can_id: 0x05004400
+        can_id_mask: 0x1F00FFFF
+        use_extended_id: true
+        then:
+          - if:
+              condition:
+                lambda: |-
+                  if (x.size() < 6) return false;
+                  for (int i = 0; i < 6; i++) id(pending_serial)[i] = x[i];
+                  id(pending_serial)[6] = 0;
+                  id(pending_serial)[7] = 0;
+                  return true;
+              then:
+                - script.execute:
+                    id: register_rectifier
+                    source: "Login request received"
+
+      # All PSU-specific status frames: 0x05[unit]40[state].
+      # State 0x04 = CV, 0x08 = CC, 0x0C = alarm, 0x10 = walk-in.
+      - can_id: 0x05004000
+        can_id_mask: 0x1F00FF00
+        use_extended_id: true
+        then:
+          - lambda: |-
+              if (x.size() < 8) return;
+              const int unit = (can_id >> 16) & 0xFF;
+              if (unit < 1 || unit > 4) return;
+              const int slot = unit - 1;
+              if (!id(rectifier_valid)[slot] && millis() > ${adopt_holdoff_ms}) {
+                // A rectifier that was already logged in when this controller
+                // restarted keeps reporting status but never sends a hello, so
+                // discovery never sees it and it would stay invisible until it
+                // is power-cycled. Adopt it by CAN address instead: telemetry
+                // works and the setpoint is broadcast, so the only thing we
+                // cannot do is refresh a login it evidently does not need.
+                //
+                // Held off for the first few seconds: a unit that still sends
+                // hellos must be discovered normally (with its serial) first,
+                // or it would be adopted at one address and then re-logged-in
+                // at another, leaving a stale slot behind.
+                id(rectifier_valid)[slot] = true;
+                id(rectifier_adopted)[slot] = true;
+                memset(&id(rectifier_serial)[slot * 8], 0, 8);
+                id(rectifier_was_online)[slot] = false;
+                // We do not know which rectifier this is, so we cannot know
+                // whose hours the slot is holding. Start it at zero rather
+                // than credit it with a stranger's wear. HA skips pushing for
+                // an adopted unit precisely because the serial is unknown, so
+                // nothing else would ever correct this.
+                id(run_seconds)[slot] = 0;
+                id(run_seconds_at_push)[slot] = 0;
+                id(unit_max_a)[slot] = 0;
+                switch (slot) {
+                  case 0: id(runtime_hours_1).publish_state(0); break;
+                  case 1: id(runtime_hours_2).publish_state(0); break;
+                  case 2: id(runtime_hours_3).publish_state(0); break;
+                  case 3: id(runtime_hours_4).publish_state(0); break;
+                }
+                ESP_LOGW("eltek", "Adopted already-logged-in rectifier at CAN address %d", unit);
+              }
+
+              float current = (256 * x[2] + x[1]) / 10.0f;
+              if (current > 100.0f) current = 0.0f;
+              // A collapsing bus decodes to nonsense (~652 V seen during a
+              // break-before-make dropout); do not let that reach the sensors
+              // or it injects a fictional kilowatt into shelf power.
+              float vout = (256 * x[4] + x[3]) / 100.0f;
+              if (vout > 100.0f || vout < 0.0f) vout = 0.0f;
+              id(rectifier_temp_inlet)[slot] = x[0];
+              id(rectifier_iout)[slot] = current;
+              id(rectifier_vout)[slot] = vout;
+              id(rectifier_vin)[slot] = 256 * x[6] + x[5];
+              id(rectifier_temp_outlet)[slot] = x[7];
+              id(rectifier_state)[slot] = can_id & 0xFF;
+              id(rectifier_last_seen_ms)[slot] = millis();
+              id(rectifier_last_heard_ms)[slot] = millis();
+
+              // 0x04 is normal running, so any previously latched fault bits
+              // are stale. Otherwise ask which warning/alarm is set, but only
+              // every 5 s per unit - status arrives about ten times a second.
+              const uint8_t st = can_id & 0xFF;
+              if (st == 0x04) {
+                id(rectifier_warn_bits)[slot] = 0;
+                id(rectifier_alarm_bits)[slot] = 0;
+              } else if (st == 0x08 || st == 0x0C) {
+                const uint32_t now_ms = millis();
+                if (now_ms - id(rectifier_fault_query_ms)[slot] > 5000 &&
+                    !id(observe_mode).state) {
+                  id(rectifier_fault_query_ms)[slot] = now_ms;
+                  const uint32_t q = 0x0500BFFC | (unit << 16);
+                  std::vector<uint8_t> warn = {0x08, 0x04, 0x00};
+                  std::vector<uint8_t> alrm = {0x08, 0x08, 0x00};
+                  id(eltek).send_data(q, true, warn);
+                  id(eltek).send_data(q, true, alrm);
+                }
+              }
+
+      # Available max current reply: 0x05XX9C00, request 20 01 00 ->
+      # response 23 01 00 <LE16 deci-amps>.
+      - can_id: 0x05009C00
+        can_id_mask: 0x1F00FFFF
+        use_extended_id: true
+        then:
+          - lambda: |-
+              if (x.size() < 5 || x[0] != 0x23 || x[1] != 0x01) return;
+              const int unit = (can_id >> 16) & 0xFF;
+              if (unit < 1 || unit > 4) return;
+              const float a = ((uint16_t) x[3] | ((uint16_t) x[4] << 8)) / 10.0f;
+              if (a > 1.0f && a < 60.0f) id(unit_max_a)[unit - 1] = a;
+
+      # Serial-number reply, 0x05XXBC00 selector 0x08. Chunked: the first frame
+      # sets bit 7 of the sequence byte and the count counts down to 1.
+      - can_id: 0x0500BC00
+        can_id_mask: 0x1F00FFFF
+        use_extended_id: true
+        then:
+          - lambda: |-
+              if (x.size() < 4 || x[0] != 0x53 || x[1] != 0x08) return;
+              ESP_LOGW("eltek", "serial chunk from 0x%08X seq 0x%02X", can_id, x[2]);
+              const int unit = (can_id >> 16) & 0xFF;
+              if (unit < 1 || unit > 4) return;
+              const int slot = unit - 1;
+              const uint8_t seq = x[2];
+              if (seq & 0x80) id(serial_asm_len)[slot] = 0;
+              for (size_t i = 3; i < x.size(); i++) {
+                uint8_t &len = id(serial_asm_len)[slot];
+                if (len >= 8) break;
+                id(serial_asm)[slot * 8 + len] = x[i];
+                len++;
+              }
+              if ((seq & 0x7F) == 1 && id(serial_asm_len)[slot] >= 6 &&
+                  id(rectifier_adopted)[slot]) {
+                memcpy(&id(rectifier_serial)[slot * 8], &id(serial_asm)[slot * 8], 6);
+                id(rectifier_serial)[slot * 8 + 6] = 0;
+                id(rectifier_serial)[slot * 8 + 7] = 0;
+                id(rectifier_adopted)[slot] = false;
+                ESP_LOGW("eltek", "Recovered serial for adopted rectifier at address %d", unit);
+              }
+
+      # Warning/alarm detail, 0x05XXBFFC. Request and response share the ID;
+      # the response is distinguished by 0x0E in byte 0 (a request carries 0x08).
+      - can_id: 0x0500BFFC
+        can_id_mask: 0x1F00FFFF
+        use_extended_id: true
+        then:
+          - lambda: |-
+              const int unit = (can_id >> 16) & 0xFF;
+              if (unit < 1 || unit > 4) return;
+              const int slot = unit - 1;
+
+              // The serial is served on 0xBFFC as well as 0xBC00; accept it here
+              // too, since one of the two may be gated on state we cannot see.
+              if (x.size() >= 4 && x[0] == 0x53 && x[1] == 0x08) {
+                ESP_LOGW("eltek", "serial chunk from 0x%08X seq 0x%02X", can_id, x[2]);
+                const uint8_t seq = x[2];
+                if (seq & 0x80) id(serial_asm_len)[slot] = 0;
+                for (size_t i = 3; i < x.size(); i++) {
+                  uint8_t &len = id(serial_asm_len)[slot];
+                  if (len >= 8) break;
+                  id(serial_asm)[slot * 8 + len] = x[i];
+                  len++;
+                }
+                if ((seq & 0x7F) == 1 && id(serial_asm_len)[slot] >= 6 &&
+                    id(rectifier_adopted)[slot]) {
+                  memcpy(&id(rectifier_serial)[slot * 8], &id(serial_asm)[slot * 8], 6);
+                  id(rectifier_serial)[slot * 8 + 6] = 0;
+                  id(rectifier_serial)[slot * 8 + 7] = 0;
+                  id(rectifier_adopted)[slot] = false;
+                  ESP_LOGW("eltek", "Recovered serial for adopted rectifier at address %d", unit);
+                }
+                return;
+              }
+
+              if (x.size() < 5 || x[0] != 0x0E) return;
+              const uint16_t bits = (uint16_t) x[3] | ((uint16_t) x[4] << 8);
+              if (x[1] == 0x04) id(rectifier_warn_bits)[slot] = bits;
+              else if (x[1] == 0x08) id(rectifier_alarm_bits)[slot] = bits;
+
+      # Every frame on the bus, for diagnosis: a zero mask makes the acceptance
+      # filter compare no bits at all, so this matches everything.
+      - can_id: 0x00000000
+        can_id_mask: 0x00000000
+        use_extended_id: true
+        then:
+          - lambda: |-
+              if (!id(can_sniffer_enabled).state) return;
+              char buf[80];
+              int n = snprintf(buf, sizeof(buf), "RX 0x%08X [%d]", can_id, (int) x.size());
+              for (size_t i = 0; i < x.size() && n < (int) sizeof(buf) - 4; i++)
+                n += snprintf(buf + n, sizeof(buf) - n, " %02X", x[i]);
+              ESP_LOGW("cansniff", "%s", buf);
+
+interval:
+  # Keep every discovered rectifier logged in. Login expires after roughly
+  # 12.8 seconds, so five seconds leaves ample margin.
+  - interval: 5s
+    then:
+      - lambda: |-
+          // Only refresh a slot that is still announcing itself. Renewing a
+          // departed unit's login forever would stop it ever expiring, which
+          // is exactly what makes its address safe to hand to a replacement.
+          if (id(observe_mode).state) return;
+          const uint32_t now = millis();
+          for (int slot = 0; slot < 4; slot++) {
+            if (!id(rectifier_valid)[slot]) continue;
+            // An adopted slot has no serial to log in with - so ask it for one.
+            // 0x05XXBC00 selector 0x08 returns the serial as a multi-frame
+            // string; once it lands the slot stops being adopted and rejoins
+            // the normal login refresh.
+            // An adopted slot has no serial to log in with. The enumeration
+            // prompt below will make it announce one; until then, skip it.
+            if (id(rectifier_adopted)[slot]) continue;
+            const uint32_t last_activity = id(rectifier_last_seen_ms)[slot] != 0
+                ? id(rectifier_last_seen_ms)[slot]
+                : id(rectifier_last_heard_ms)[slot];
+            if (last_activity != 0 &&
+                now - last_activity > ${login_grace_ms}) continue;
+            std::vector<uint8_t> login(
+              &id(rectifier_serial)[slot * 8], &id(rectifier_serial)[slot * 8] + 8);
+            id(eltek).send_data(
+              0x05004800 | ((slot + 1) * 4), true, login);
+          }
+
+  # Ask each rectifier what it can currently deliver. Cheap, and it keeps the
+  # capacity figure honest as input voltage or temperature change.
+  - interval: 30s
+    then:
+      - lambda: |-
+          if (id(observe_mode).state) return;
+          for (int slot = 0; slot < 4; slot++) {
+            if (!id(rectifier_valid)[slot]) continue;
+            std::vector<uint8_t> q = {0x20, 0x01, 0x00};
+            id(eltek).send_data(0x05009C00 | ((slot + 1) << 16), true, q);
+          }
+
+  # Re-enumerate periodically: one frame every 30 s, and immediately whenever a
+  # slot is still anonymous. Cheap, and it self-heals any unit that was logged
+  # in before this controller started.
+  - interval: 30s
+    then:
+      - lambda: |-
+          if (id(observe_mode).state) return;
+          std::vector<uint8_t> prompt = {0x6D, 0x30, 0x00};
+          id(eltek).send_data(0x0500BC02, true, prompt);
+
+  # ---------------- Efficiency manager ----------------
+  # Decides how many rectifiers need to run, parks the surplus, and rotates duty
+  # so runtime is spread. Modelled on the Smartpack behaviour captured on the
+  # bench: park by repeated keepalive, and always make-before-break.
+  - interval: 1s
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+
+          // ---- accumulate this session's runtime for units actually working
+          for (int i = 0; i < 4; i++) {
+            if (id(rectifier_valid)[i] && !id(park_active)[i] &&
+                id(rectifier_last_seen_ms)[i] != 0 &&
+                now - id(rectifier_last_seen_ms)[i] <= 3000) {
+              id(run_seconds)[i]++;
+            }
+          }
+
+          // ---- who is present and usable
+          bool present[4] = {false, false, false, false};
+          int present_n = 0;
+          for (int i = 0; i < 4; i++) {
+            present[i] = id(rectifier_valid)[i] &&
+                         id(rectifier_last_seen_ms)[i] != 0 &&
+                         now - id(rectifier_last_seen_ms)[i] <= 3000;
+            if (present[i]) present_n++;
+          }
+
+          if (!id(efficiency_enabled).state || present_n == 0) {
+            // Disabled: release everything and hold the shuffle timer.
+            for (int i = 0; i < 4; i++) id(park_target)[i] = false;
+            id(trans_phase) = 0;
+            id(trans_out) = -1;
+            id(trans_in) = -1;
+            id(shuffle_last_ms) = now;
+          } else {
+            // ---- how many units are actually needed
+            float fallback = id(rect_max_current).state;
+            if (isnan(fallback) || fallback < 1.0f) fallback = 26.8f;
+            // Per-unit capability, polled from each rectifier.
+            float cap[4];
+            for (int i = 0; i < 4; i++)
+              cap[i] = (id(unit_max_a)[i] > 1.0f) ? id(unit_max_a)[i] : fallback;
+            // Representative single-unit capacity = the weakest present unit,
+            // so sizing never assumes more headroom than the shelf really has.
+            float unit_max = fallback; bool any_known = false;
+            for (int i = 0; i < 4; i++) {
+              if (!present[i]) continue;
+              if (!any_known || cap[i] < unit_max) unit_max = cap[i];
+              any_known = true;
+            }
+            float load = 0;
+            for (int i = 0; i < 4; i++)
+              if (present[i]) load += id(rectifier_iout)[i];
+            // ~30 s smoothing, so a transient never moves a rectifier.
+            id(load_avg) += (load - id(load_avg)) / 30.0f;
+            const float avg = id(load_avg);
+
+            int running = 0;
+            for (int i = 0; i < 4; i++) if (present[i] && !id(park_target)[i]) running++;
+            if (running < 1) running = 1;
+
+            // Eltek's efficient band is 50-80% of a rectifier's output. Ideal is
+            // the fewest units that keep average load at or under 80% each;
+            // redundancy then adds one more.
+            // Waking must NOT wait for the average. After a step load increase
+            // the 30 s EMA needs roughly 37 s to cross the 80% line, and until
+            // it does the running units are commanded the whole shelf limit
+            // and the bus sags. Size on whichever is higher, so a rising load
+            // is answered at once while a falling one still decays slowly.
+            // This can only ever raise the unit count: shedding is separately
+            // gated on the average via may_shed and the 30 s hold below, so a
+            // transient can add a rectifier but can never remove one.
+            const float wake_basis = load > avg ? load : avg;
+            int ideal = (int) ceilf(wake_basis / (unit_max * 0.8f));
+            if (ideal < 1) ideal = 1;
+            int required = ideal + (id(efficiency_redundancy).state ? 1 : 0);
+            if (required > present_n) required = present_n;
+
+            // Shedding also has to satisfy the documented trigger: average load
+            // below ~50% of the capacity currently running. Combined with the
+            // 80% wake threshold this gives a deadband, so nothing oscillates.
+            const float running_cap = running * unit_max;
+            const bool may_shed = running_cap > 0 && avg < 0.5f * running_cap;
+            if (!may_shed && required < running) required = running;
+
+            // and it must hold for 30 s before anything is parked
+            if (required < running) {
+              if (id(shed_hold_ms) == 0) id(shed_hold_ms) = now;
+              if (now - id(shed_hold_ms) < 30000) required = running;
+            } else {
+              id(shed_hold_ms) = 0;
+            }
+
+            // total runtime = HA-held hours + this session
+            float total[4];
+            for (int i = 0; i < 4; i++) {
+              float h = 0;
+              switch (i) {
+                case 0: h = id(runtime_hours_1).state; break;
+                case 1: h = id(runtime_hours_2).state; break;
+                case 2: h = id(runtime_hours_3).state; break;
+                case 3: h = id(runtime_hours_4).state; break;
+              }
+              if (isnan(h)) h = 0;
+              // Only the sliver since HA's last push. If HA goes away the
+              // slice keeps growing, so rotation degrades gracefully instead
+              // of freezing on a stale total.
+              const uint32_t since = id(run_seconds)[i] >= id(run_seconds_at_push)[i]
+                  ? id(run_seconds)[i] - id(run_seconds_at_push)[i] : 0;
+              total[i] = h + since / 3600.0f;
+            }
+
+            // ---- need more running: wake the least-used parked unit at once
+            while (running < required) {
+              int best = -1;
+              for (int i = 0; i < 4; i++)
+                if (present[i] && id(park_target)[i] &&
+                    (best < 0 || total[i] < total[best])) best = i;
+              if (best < 0) break;
+              id(park_target)[best] = false;
+              running++;
+              ESP_LOGW("eltek", "efficiency: waking rectifier %d (need %d)", best + 1, required);
+            }
+
+            // ---- surplus: park the most-used running unit, one at a time
+            if (running > required && id(trans_phase) == 0) {
+              int worst = -1;
+              for (int i = 0; i < 4; i++)
+                if (present[i] && !id(park_target)[i] &&
+                    (worst < 0 || total[i] > total[worst])) worst = i;
+              if (worst >= 0) {
+                id(park_target)[worst] = true;
+                ESP_LOGW("eltek", "efficiency: parking rectifier %d (surplus)", worst + 1);
+              }
+            }
+
+            // ---- rotation, make-before-break
+            const uint32_t shuffle_ms =
+                (uint32_t) (id(shuffle_time_hours).state * 3600000.0f);
+            const uint32_t overlap_ms =
+                (uint32_t) (id(transition_time_min).state * 60000.0f);
+
+            if (id(trans_phase) == 0 && running >= 1 && running < present_n &&
+                (id(force_shuffle) || now - id(shuffle_last_ms) >= shuffle_ms)) {
+              id(force_shuffle) = false;
+              int out_i = -1, in_i = -1;
+              for (int i = 0; i < 4; i++) {
+                if (!present[i]) continue;
+                if (!id(park_target)[i] && (out_i < 0 || total[i] > total[out_i])) out_i = i;
+                if (id(park_target)[i] && (in_i < 0 || total[i] < total[in_i])) in_i = i;
+              }
+              if (out_i >= 0 && in_i >= 0 && out_i != in_i) {
+                id(park_target)[in_i] = false;     // incoming comes up FIRST
+                id(trans_out) = out_i;
+                id(trans_in) = in_i;
+                id(trans_start_ms) = now;
+                id(trans_phase) = 1;
+                ESP_LOGW("eltek", "shuffle: rectifier %d in, %d out after %.1f min",
+                         in_i + 1, out_i + 1, id(transition_time_min).state);
+              }
+              id(shuffle_last_ms) = now;
+            }
+
+            if (id(trans_phase) == 1) {
+              const int out_i = id(trans_out);
+              const int in_i = id(trans_in);
+              const uint32_t elapsed = now - id(trans_start_ms);
+              // The overlap timer is a floor, not the trigger. What actually
+              // authorises the hand-over is the incoming unit being ready:
+              // present, released, out of walk-in, and settled for as long as
+              // the allocator needs before it widens the current split. Parking
+              // on the timer alone would drop the bus if the newcomer never
+              // came up - which is the one failure this whole make-before-break
+              // dance exists to prevent.
+              const bool in_present = in_i >= 0 && in_i < 4 && present[in_i];
+              const bool in_ready = in_present &&
+                  !id(park_active)[in_i] &&
+                  id(rectifier_state)[in_i] != 0x10 &&
+                  id(rectifier_was_carrying)[in_i] &&
+                  now - id(carry_settle_ms)[in_i] >= ${carry_settle_ms};
+
+              if (!in_present) {
+                // Nothing to hand over to - abandon the rotation and leave the
+                // outgoing unit carrying. It keeps its duty until next time.
+                ESP_LOGW("eltek", "shuffle: incoming rectifier %d gone - aborted, %d keeps running",
+                         in_i + 1, out_i + 1);
+                id(trans_phase) = 0; id(trans_out) = -1; id(trans_in) = -1;
+              } else if (elapsed >= overlap_ms && in_ready) {
+                if (out_i >= 0 && out_i < 4 && present[out_i]) {
+                  id(park_target)[out_i] = true;
+                  ESP_LOGW("eltek", "shuffle: rectifier %d ready, parking %d", in_i + 1, out_i + 1);
+                }
+                id(trans_phase) = 0; id(trans_out) = -1; id(trans_in) = -1;
+              } else if (elapsed >= overlap_ms + 60000) {
+                // Readiness never arrived. Give up rather than hold trans_phase
+                // open forever, which would block both future rotations and the
+                // surplus-park path.
+                ESP_LOGW("eltek", "shuffle: rectifier %d never became ready after %.0f s - aborted, %d keeps running",
+                         in_i + 1, elapsed / 1000.0f, out_i + 1);
+                id(trans_phase) = 0; id(trans_out) = -1; id(trans_in) = -1;
+              }
+            }
+          }
+
+          // ---- execute: park keepalive / release
+          if (id(observe_mode).state) return;
+          float pv = id(park_voltage).state;
+          if (isnan(pv)) pv = 45.6f;
+          const uint16_t p10 = (uint16_t) lroundf(pv * 10.0f);
+
+          // Send-and-log helper. The CAN sniffer is an on_frame trigger, so it
+          // only ever sees RECEIVED frames - it cannot show what this
+          // controller transmits. This logs the TX side in the same format so
+          // both directions land in one capture, distinguishable by prefix.
+          // Only the park/release path uses it; logging the 1 Hz setpoint
+          // broadcast would bury everything else.
+          auto tx = [&](uint32_t cid, const std::vector<uint8_t> &d) {
+            id(eltek).send_data(cid, true, d);
+            if (!id(tx_log_enabled).state) return;
+            char b[80];
+            int n = snprintf(b, sizeof(b), "TX 0x%08X [%d]", cid, (int) d.size());
+            for (size_t i = 0; i < d.size() && n < (int) sizeof(b) - 4; i++)
+              n += snprintf(b + n, sizeof(b) - n, " %02X", d[i]);
+            ESP_LOGW("cansniff", "%s", b);
+          };
+
+          // SETTLED ON THE BENCH 2026-08-30. 0x05XXAC02 is the park/standby
+          // COMMAND; 0x05XXAC00 is the rectifier's RESPONSE to it, arriving
+          // 3-33 ms later with the same voltage echoed back. Sending AC00
+          // ourselves does nothing at all - 70 s of AC00-only left the unit
+          // running and drew no reply, while AC02-only held the park
+          // indefinitely and was answered every time.
+          //
+          // The original Smartpack capture was misread: its "AC02 then AC00
+          // pair, 507 of 507" was one request and one response, not two
+          // commands. Same for release - a single broadcast AC02 at unit zero
+          // answered by one AC00 per rectifier, which is why those replies
+          // arrive in no particular order.
+          //
+          // So this sends AC02 and nothing else. The redundant AC00 this
+          // controller used to emit was byte-identical to a rectifier's reply
+          // on the same ID, which on a bus shared with a Smartpack would have
+          // been indistinguishable from one - reason enough to drop it beyond
+          // simple tidiness.
+
+          for (int slot = 0; slot < 4; slot++) {
+            if (!id(rectifier_valid)[slot]) continue;
+            const uint32_t unit = slot + 1;
+            if (id(park_target)[slot]) {
+              // refresh at 3.5 s - the Smartpack repeats about every 4 s.
+              if (!id(park_active)[slot] || now - id(park_last_send)[slot] >= 3500) {
+                std::vector<uint8_t> ac02 = {0x7B, 0x04, 0x00,
+                                             (uint8_t) (p10 >> 8), (uint8_t) (p10 & 0xFF), 0x01, 0x01};
+                tx(0x0500AC02 | (unit << 16), ac02);
+                id(park_active)[slot] = true;
+                id(park_last_send)[slot] = now;
+              }
+            } else if (id(park_active)[slot]) {
+              // DELIBERATE DIVERGENCE from the Smartpack. It releases with a
+              // single AC02 at unit zero - the broadcast address - so every
+              // rectifier drops out of standby together and any that should
+              // stay parked is re-parked on the next 4 s keepalive. That is
+              // fine for the vendor controller, but it would put a still-parked
+              // unit through a spurious release-and-repark in the middle of our
+              // make-before-break rotation. Addressing the release to one unit
+              // keeps the other slots untouched, and per-unit AC02 is now
+              // proven to work: it is what holds the park in the first place.
+              std::vector<uint8_t> ac02 = {0x7B, 0x04, 0x00, 0x00, 0x00, 0x01, 0x01};
+              tx(0x0500AC02 | (unit << 16), ac02);
+              id(park_active)[slot] = false;
+              ESP_LOGW("eltek", "released rectifier %d", (int) unit);
+            }
+          }
+
+  # Health evaluation and shelf-current allocation.
+  - interval: 1s
+    then:
+      - lambda: |-
+          const uint32_t ONLINE_TIMEOUT_MS = 3000;
+          // How long a unit must have been out of walk-in before it is counted
+          // in the current split. Walk-in itself is about five seconds.
+          const uint32_t CARRY_SETTLE_MS = ${carry_settle_ms};
+          const uint32_t now = millis();
+          bool online[4] = {false, false, false, false};
+          bool comms_ok[4] = {false, false, false, false};
+          bool carrying[4] = {false, false, false, false};
+          bool sharing[4] = {false, false, false, false};
+          int active = 0;
+          int discovered = 0;
+          int sharing_n = 0;
+
+          for (int slot = 0; slot < 4; slot++) {
+            // An adopted slot holds no serial, so if it stops reporting there
+            // is nothing worth keeping - drop it rather than leave a ghost.
+            if (id(rectifier_valid)[slot] && id(rectifier_adopted)[slot] &&
+                id(rectifier_last_seen_ms)[slot] != 0 &&
+                now - id(rectifier_last_seen_ms)[slot] > ${address_reuse_ms}) {
+              id(rectifier_valid)[slot] = false;
+              id(rectifier_adopted)[slot] = false;
+              ESP_LOGW("eltek", "Dropped stale adopted rectifier at CAN address %d", slot + 1);
+            }
+            if (id(rectifier_valid)[slot]) discovered++;
+            // "comms" = the unit is talking to us, park state irrelevant. This is
+            // what drives telemetry visibility, so a parked rectifier keeps
+            // reporting its voltage, current and temperatures.
+            const bool comms = id(rectifier_valid)[slot] &&
+                id(rectifier_last_seen_ms)[slot] != 0 &&
+                (now - id(rectifier_last_seen_ms)[slot] <= ONLINE_TIMEOUT_MS);
+            // "online" = comms AND not parked. Drives the active count, the
+            // status LED and the shelf sensors. Load sharing uses the
+            // narrower "sharing" test below.
+            online[slot] = comms && !id(park_active)[slot];
+            comms_ok[slot] = comms;
+
+            // A rectifier still ramping (status 0x10, walk-in) cannot yet take
+            // its share of the load. Counting it the instant it appears would
+            // shrink the incumbents' limit before the newcomer can make up the
+            // difference - the same shortfall as a break-before-make gap,
+            // which on a battery-less bus pulls the voltage down.
+            carrying[slot] = online[slot] && id(rectifier_state)[slot] != 0x10;
+            // Settle hold: a unit that has only just started carrying is left
+            // out of the split for a few seconds. That covers the tail of its
+            // ramp and stops a unit flapping at the comms timeout from
+            // oscillating the divisor once per second.
+            if (carrying[slot] && !id(rectifier_was_carrying)[slot])
+              id(carry_settle_ms)[slot] = now;
+            sharing[slot] = carrying[slot] &&
+                now - id(carry_settle_ms)[slot] >= CARRY_SETTLE_MS;
+
+            if (online[slot]) active++;
+            if (sharing[slot]) sharing_n++;
+          }
+
+          id(active_rectifier_count) = active;
+          id(discovered_rectifier_count) = discovered;
+
+          // Split over the units genuinely carrying. If none have settled yet
+          // - at boot, or when every unit is ramping at once - fall back to
+          // the online count, so the divisor is never zero and a setpoint
+          // still goes out.
+          bool counted[4];
+          for (int i = 0; i < 4; i++) counted[i] = sharing_n > 0 ? sharing[i] : online[i];
+          const int split = sharing_n > 0 ? sharing_n : active;
+
+          float requested = id(shelf_current_limit).state;
+          if (isnan(requested) || requested < 0.1f) requested = 0.1f;
+          float share = split > 0 ? requested / split : 0.0f;
+          // Clamp to what the weakest COUNTED unit can actually deliver; fall
+          // back to the configured figure for any unit that has not answered.
+          float unit_max = id(rect_max_current).state;
+          if (isnan(unit_max) || unit_max < 1.0f) unit_max = 26.8f;
+          bool any_known = false; float weakest = 0;
+          for (int i = 0; i < 4; i++) {
+            if (!counted[i] || id(unit_max_a)[i] <= 1.0f) continue;
+            if (!any_known || id(unit_max_a)[i] < weakest) weakest = id(unit_max_a)[i];
+            any_known = true;
+          }
+          if (any_known) unit_max = weakest;
+          if (share > unit_max) share = unit_max;
+          if (split > 0 && share < 0.1f) share = 0.1f;
+          id(allocated_current_per_rectifier) = share;
+          // The command is broadcast to every online rectifier, including one
+          // still walking in. Report the aggregate commanded ceiling honestly;
+          // during make-before-break this can exceed the steady-state request.
+          id(effective_shelf_current_limit) = share * active;
+
+          float volts = id(eltek_voltage).state;
+          if (isnan(volts)) volts = 48.0f;
+          const uint16_t i10 = (uint16_t) lroundf(share * 10.0f);
+          const uint16_t u100 = (uint16_t) lroundf(volts * 100.0f);
+          // Over-voltage protection, sent with every setpoint. Pack-specific,
+          // so it comes from the ovp_voltage substitution at the top of this
+          // file rather than being hardcoded to the 59.50 V the Smartpack
+          // happened to be configured with.
+          const uint16_t ovp = (uint16_t) lroundf(${ovp_voltage}f * 100.0f);
+          std::vector<uint8_t> command = {
+            (uint8_t) (i10 & 0xFF), (uint8_t) (i10 >> 8),
+            (uint8_t) (u100 & 0xFF), (uint8_t) (u100 >> 8),
+            (uint8_t) (u100 & 0xFF), (uint8_t) (u100 >> 8),
+            (uint8_t) (ovp & 0xFF), (uint8_t) (ovp >> 8)
+          };
+
+          // 0x05FF4004 is the only set-output ID the rectifiers honour; the
+          // per-unit form 0x05<id>4004 is the ID they *transmit* status on and
+          // is silently ignored. One broadcast therefore sets every logged-in
+          // unit, which matches the design: each active unit gets the same
+          // share. A newcomer therefore cannot be given a different figure from
+          // the incumbents, and picks up whatever was last broadcast until the
+          // next tick. That is bounded and safe: an arriving unit spends its
+          // first seconds in walk-in, ramping, and the settle hold above keeps
+          // it out of the divisor until it is out of walk-in - so the split
+          // only widens once the new unit can actually carry its portion.
+          // Broadcast only while synced. With per-unit mode selected the
+          // broadcast is suppressed, otherwise it would overwrite whatever the
+          // per-unit frames just set, one second later.
+          if (active > 0 && !id(observe_mode).state && id(sync_setpoints).state) {
+            id(eltek).send_data(0x05FF4004, true, command);
+          }
+
+          for (int slot = 0; slot < 4; slot++) {
+            id(rectifier_was_online)[slot] = comms_ok[slot];
+            // Track carrying, not sharing: latching the settled flag here
+            // would re-stamp carry_settle_ms every tick of the hold and the
+            // unit would never join the split.
+            id(rectifier_was_carrying)[slot] = carrying[slot];
+          }
+
+      - script.execute: update_status_led
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_led
+    pin: GPIO${led_pin}
+    num_leds: 1
+    channel_colors: GRB
+    chipset: SK6812
+    use_psram: false
+    name: "Status LED"
+    icon: mdi:led-strip-variant
+    restore_mode: ALWAYS_ON
+    effects:
+      - pulse:
+          name: "Pulse Blue Boot"
+          transition_length: 700ms
+          update_interval: 700ms
+      - strobe:
+          name: "Strobe Amber Warning"
+          colors:
+            - state: true
+              brightness: 70%
+              red: 100%
+              green: 55%
+              blue: 0%
+              duration: 600ms
+            - state: false
+              duration: 600ms
+      - strobe:
+          name: "Strobe Red Fault"
+          colors:
+            - state: true
+              brightness: 100%
+              red: 100%
+              green: 0%
+              blue: 0%
+              duration: 150ms
+            - state: false
+              duration: 150ms
+
+script:
+  # Shared discovery path for both PSU announcement frames. Consumes the
+  # serial staged in pending_serial, assigns or reuses a logical slot, logs
+  # the unit in. The 1 s allocator keeps a newcomer out of the divisor while it
+  # reports walk-in and for a short settle period after it begins carrying.
+  - id: register_rectifier
+    parameters:
+      source: string
+    then:
+      - lambda: |-
+          uint8_t serial[8];
+          memcpy(serial, id(pending_serial), 8);
+          const uint32_t now = millis();
+          int slot = -1;
+
+          // Reuse an existing record for the same serial number.
+          for (int i = 0; i < 4; i++) {
+            if (id(rectifier_valid)[i] &&
+                memcmp(&id(rectifier_serial)[i * 8], serial, 8) == 0) {
+              slot = i;
+              break;
+            }
+          }
+
+          // Otherwise take an unused logical slot.
+          if (slot < 0) {
+            for (int i = 0; i < 4; i++) {
+              if (!id(rectifier_valid)[i]) {
+                slot = i;
+                break;
+              }
+            }
+          }
+
+          // A replacement may reuse a slot only after the old login has
+          // certainly expired, preventing two serials from sharing an ID.
+          if (slot < 0) {
+            uint32_t oldest_age = 0;
+            for (int i = 0; i < 4; i++) {
+              // A unit that logged in but never produced a status frame has
+              // last_seen == 0. Fall back to its last hello/login timestamp
+              // so a dead-on-arrival unit cannot occupy a slot forever.
+              uint32_t last_activity = id(rectifier_last_seen_ms)[i] != 0
+                  ? id(rectifier_last_seen_ms)[i]
+                  : id(rectifier_last_heard_ms)[i];
+              uint32_t age = now - last_activity;
+              if (last_activity != 0 && age > ${address_reuse_ms} &&
+                  age > oldest_age) {
+                oldest_age = age;
+                slot = i;
+              }
+            }
+          }
+
+          if (slot < 0) {
+            ESP_LOGW("eltek", "%s, but no address is safe to reuse yet", source.c_str());
+            return;
+          }
+
+          const bool is_new = !id(rectifier_valid)[slot] ||
+              memcmp(&id(rectifier_serial)[slot * 8], serial, 8) != 0;
+          if (is_new) {
+            memcpy(&id(rectifier_serial)[slot * 8], serial, 8);
+            id(rectifier_valid)[slot] = true;
+            id(rectifier_adopted)[slot] = false;
+            id(rectifier_last_seen_ms)[slot] = 0;
+            id(rectifier_was_online)[slot] = false;
+            id(rectifier_vin)[slot] = 0;
+            id(rectifier_vout)[slot] = 0;
+            id(rectifier_iout)[slot] = 0;
+            id(rectifier_temp_inlet)[slot] = 0;
+            id(rectifier_temp_outlet)[slot] = 0;
+            id(rectifier_state)[slot] = 0;
+            // A CAN address is a slot, not a rectifier: which unit occupies it
+            // depends on login order, so it can change across a power cycle or
+            // a hot swap. Clear everything the slot accumulated for the unit
+            // that just left, or the arriving one inherits it.
+            //
+            // runtime_hours is the one that bites. It is written only by Home
+            // Assistant, which resolves it by serial, so until the next push
+            // the slot still holds the DEPARTED unit's lifetime total - and a
+            // brand-new rectifier looks like the most-worn one on the shelf,
+            // which is precisely the unit rotation parks first. Seen on the
+            // bench 2026-09-20: a new unit dropped into slot 1 showed 249 h,
+            // inherited from the rectifier that had been there.
+            //
+            // Zeroing biases a newcomer toward "least used", which is both the
+            // safe direction and usually the true one. HA corrects it within
+            // seconds via its serial-change trigger - unless the unit was
+            // adopted by address with no serial, in which case HA never pushes
+            // at all and the stale figure would have stood forever.
+            id(run_seconds)[slot] = 0;
+            id(run_seconds_at_push)[slot] = 0;
+            id(unit_max_a)[slot] = 0;
+            switch (slot) {
+              case 0: id(runtime_hours_1).publish_state(0); break;
+              case 1: id(runtime_hours_2).publish_state(0); break;
+              case 2: id(runtime_hours_3).publish_state(0); break;
+              case 3: id(runtime_hours_4).publish_state(0); break;
+            }
+            ESP_LOGI("eltek", "Discovered rectifier; assigning CAN address %d", slot + 1);
+          }
+          id(rectifier_last_heard_ms)[slot] = now;
+
+          // Log the unit in. No set-output frame is sent here: the only ID the
+          // rectifiers accept is a broadcast, so commanding a newcomer would
+          // drag every other unit to the same value. The 1 s allocator picks
+          // it up on its next pass.
+          if (id(observe_mode).state) return;
+          std::vector<uint8_t> login(serial, serial + 8);
+          id(eltek).send_data(0x05004800 | ((slot + 1) * 4), true, login);
+
+  - id: update_status_led
+    then:
+      - lambda: |-
+          const int OVERTEMP_C = 70;
+          bool alarm = false;
+          bool overtemp = false;
+          for (int slot = 0; slot < 4; slot++) {
+            if (!id(rectifier_was_online)[slot]) continue;
+            // A real alarm, or a warning that is NOT merely current limit.
+            alarm |= id(rectifier_state)[slot] == 0x0C;
+            alarm |= id(rectifier_state)[slot] == 0x08 &&
+                     id(rectifier_warn_bits)[slot] != 0x0080;
+            overtemp |= id(rectifier_temp_inlet)[slot] > OVERTEMP_C ||
+                        id(rectifier_temp_outlet)[slot] > OVERTEMP_C;
+          }
+
+          auto call = id(status_led).turn_on();
+          if (overtemp ||
+              (id(discovered_rectifier_count) > 0 && id(active_rectifier_count) == 0)) {
+            call.set_rgb(1.0f, 0.0f, 0.0f);
+            call.set_brightness(1.0f);
+            call.set_effect("Strobe Red Fault");
+          } else if (alarm) {
+            call.set_rgb(1.0f, 0.55f, 0.0f);
+            call.set_brightness(0.7f);
+            call.set_effect("Strobe Amber Warning");
+          } else if (id(active_rectifier_count) > 0) {
+            call.set_rgb(0.0f, 1.0f, 0.0f);
+            call.set_brightness(0.15f);
+            call.set_effect("None");
+          } else {
+            call.set_rgb(0.0f, 0.3f, 1.0f);
+            call.set_brightness(0.6f);
+            call.set_effect("Pulse Blue Boot");
+          }
+          call.perform();
+
+number:
+  - platform: template
+    name: "Voltage Setpoint"
+    id: eltek_voltage
+    device_class: voltage
+    unit_of_measurement: "V"
+    restore_value: true
+    initial_value: ${float_voltage}
+    min_value: ${voltage_min}
+    max_value: ${voltage_max}
+    step: 0.1
+    optimistic: true
+
+  # TOTAL shelf current, divided across active rectifiers - NOT a per-rectifier
+  # limit. 15 A here is 7.5 A each with two units, 5 A each with three. The
+  # legacy single-rectifier controller's 15 A meant 15 A for that one unit.
+  - platform: template
+    name: "Shelf Current Limit"
+    id: shelf_current_limit
+    device_class: current
+    unit_of_measurement: "A"
+    restore_value: true
+    initial_value: ${shelf_current}
+    min_value: 0.10
+    max_value: 166.80
+    step: 0.1
+    optimistic: true
+
+  - platform: template
+    name: "Rectifier 1 Voltage"
+    id: rect_1_voltage
+    device_class: voltage
+    unit_of_measurement: "V"
+    restore_value: true
+    initial_value: ${float_voltage}
+    min_value: ${voltage_min}
+    max_value: ${voltage_max}
+    step: 0.1
+    optimistic: true
+
+  - platform: template
+    name: "Rectifier 2 Voltage"
+    id: rect_2_voltage
+    device_class: voltage
+    unit_of_measurement: "V"
+    restore_value: true
+    initial_value: ${float_voltage}
+    min_value: ${voltage_min}
+    max_value: ${voltage_max}
+    step: 0.1
+    optimistic: true
+
+  - platform: template
+    name: "Rectifier 3 Voltage"
+    id: rect_3_voltage
+    device_class: voltage
+    unit_of_measurement: "V"
+    restore_value: true
+    initial_value: ${float_voltage}
+    min_value: ${voltage_min}
+    max_value: ${voltage_max}
+    step: 0.1
+    optimistic: true
+
+  - platform: template
+    name: "Rectifier 4 Voltage"
+    id: rect_4_voltage
+    device_class: voltage
+    unit_of_measurement: "V"
+    restore_value: true
+    initial_value: ${float_voltage}
+    min_value: ${voltage_min}
+    max_value: ${voltage_max}
+    step: 0.1
+    optimistic: true
+
+  # Read-only parameter sweep. Sends [op][selector][00] read requests across a
+  # range of selectors on one unit+function; responses land in the CAN sniffer
+  # log. Odd (write) ops are rejected in the button, so this cannot alter state.
+  - platform: template
+    name: "Probe Unit"
+    id: probe_unit
+    entity_category: diagnostic
+    restore_value: true
+    initial_value: 1
+    min_value: 1
+    max_value: 4
+    step: 1
+    optimistic: true
+
+  # 0:0x9800  1:0x9804  2:0x9C00  3:0x9FFC  4:0xBC00  5:0xBFFC
+  - platform: template
+    name: "Probe Function"
+    id: probe_function
+    entity_category: diagnostic
+    restore_value: true
+    initial_value: 3
+    min_value: 0
+    max_value: 5
+    step: 1
+    optimistic: true
+
+  # Read op codes seen in Smartpack captures: 0x08=8 0x18=24 0x20=32 0x28=40
+  # 0x50=80 0x60=96 0xC8=200. Must be even.
+  - platform: template
+    name: "Probe Op"
+    id: probe_op
+    entity_category: diagnostic
+    restore_value: true
+    initial_value: 40
+    min_value: 0
+    max_value: 254
+    step: 2
+    optimistic: true
+
+  # --- efficiency manager settings ---
+  - platform: template
+    name: "Shuffle Time Hours"
+    id: shuffle_time_hours
+    unit_of_measurement: "h"
+    icon: mdi:rotate-3d-variant
+    restore_value: true
+    initial_value: 24
+    min_value: 0.05
+    max_value: 168
+    step: 0.05
+    optimistic: true
+
+  # Overlap during a rotation: the incoming unit runs alongside the outgoing one
+  # for this long before the outgoing is parked. MUST exceed the ~11 s a parked
+  # unit needs to react and walk in, or the bus drops - which on a battery-less
+  # system also alarms the rectifiers and browns out the controller.
+  - platform: template
+    name: "Transition Time Minutes"
+    id: transition_time_min
+    unit_of_measurement: "min"
+    icon: mdi:timer-sand
+    restore_value: true
+    initial_value: 1.0
+    min_value: 0.5
+    max_value: 30.0
+    step: 0.5
+    optimistic: true
+
+  # Voltage a parked rectifier is held at. Must be below the pack's
+  # end-of-discharge voltage. The Smartpack used 45.6 V on this shelf.
+  - platform: template
+    name: "Park Voltage"
+    id: park_voltage
+    device_class: voltage
+    unit_of_measurement: "V"
+    restore_value: true
+    initial_value: 45.6
+    min_value: ${voltage_min}
+    max_value: ${voltage_max}
+    step: 0.1
+    optimistic: true
+
+  # Fallback deliverable current per rectifier, used only for a unit that has
+  # not yet answered the 0x2301 query above. NOT the 41.7 A nameplate - see the
+  # measured line-voltage table at unit_max_a. The default suits 120 V, the
+  # conservative case; raise it to ~42 for a shelf that lives on 240 V, though
+  # a discovered unit overrides it within seconds either way.
+  - platform: template
+    name: "Rectifier Max Current"
+    id: rect_max_current
+    device_class: current
+    unit_of_measurement: "A"
+    restore_value: true
+    initial_value: 26.8
+    min_value: 5.0
+    max_value: 50.0
+    step: 0.1
+    optimistic: true
+
+  # Total runtime hours for the unit in slot 1, resolved BY SERIAL: Home
+  # Assistant keeps one record per rectifier serial and pushes the matching
+  # record into whichever slot that unit currently occupies. Used here only to
+  # pick which unit to rotate out. on_value stamps the session counter so the
+  # hours already inside this total are not counted a second time.
+  - platform: template
+    name: "Rectifier 1 Runtime Hours"
+    id: runtime_hours_1
+    unit_of_measurement: "h"
+    icon: mdi:clock-outline
+    restore_value: false
+    initial_value: 0
+    min_value: 0
+    max_value: 200000
+    step: 0.01
+    optimistic: true
+    on_value:
+      then:
+        - lambda: 'id(run_seconds_at_push)[0] = id(run_seconds)[0];'
+
+  # Total runtime hours for the unit in slot 2, resolved BY SERIAL: Home
+  # Assistant keeps one record per rectifier serial and pushes the matching
+  # record into whichever slot that unit currently occupies. Used here only to
+  # pick which unit to rotate out. on_value stamps the session counter so the
+  # hours already inside this total are not counted a second time.
+  - platform: template
+    name: "Rectifier 2 Runtime Hours"
+    id: runtime_hours_2
+    unit_of_measurement: "h"
+    icon: mdi:clock-outline
+    restore_value: false
+    initial_value: 0
+    min_value: 0
+    max_value: 200000
+    step: 0.01
+    optimistic: true
+    on_value:
+      then:
+        - lambda: 'id(run_seconds_at_push)[1] = id(run_seconds)[1];'
+
+  # Total runtime hours for the unit in slot 3, resolved BY SERIAL: Home
+  # Assistant keeps one record per rectifier serial and pushes the matching
+  # record into whichever slot that unit currently occupies. Used here only to
+  # pick which unit to rotate out. on_value stamps the session counter so the
+  # hours already inside this total are not counted a second time.
+  - platform: template
+    name: "Rectifier 3 Runtime Hours"
+    id: runtime_hours_3
+    unit_of_measurement: "h"
+    icon: mdi:clock-outline
+    restore_value: false
+    initial_value: 0
+    min_value: 0
+    max_value: 200000
+    step: 0.01
+    optimistic: true
+    on_value:
+      then:
+        - lambda: 'id(run_seconds_at_push)[2] = id(run_seconds)[2];'
+
+  # Total runtime hours for the unit in slot 4, resolved BY SERIAL: Home
+  # Assistant keeps one record per rectifier serial and pushes the matching
+  # record into whichever slot that unit currently occupies. Used here only to
+  # pick which unit to rotate out. on_value stamps the session counter so the
+  # hours already inside this total are not counted a second time.
+  - platform: template
+    name: "Rectifier 4 Runtime Hours"
+    id: runtime_hours_4
+    unit_of_measurement: "h"
+    icon: mdi:clock-outline
+    restore_value: false
+    initial_value: 0
+    min_value: 0
+    max_value: 200000
+    step: 0.01
+    optimistic: true
+    on_value:
+      then:
+        - lambda: 'id(run_seconds_at_push)[3] = id(run_seconds)[3];'
+
+  # Candidate encodings for a per-unit voltage write, selected by index.
+  # 0x05XX4004 is known-dead (probed, ignored) and kept as a control.
+  #   0: 0x05XX4004  full 8-byte setpoint frame   (control - expected no effect)
+  #   1: 0x05XX9FFC  29 01 00 <V*100>  (0x28/sel 1 reads output voltage)
+  #   2: 0x05XX9C00  29 15 00 <V*100>  (EEPROM default - applies on logout)
+  #   3: 0x05XX9800  21 00 00 <V*100>
+  - platform: template
+    name: "Per-Unit Method"
+    id: per_unit_method
+    entity_category: diagnostic
+    restore_value: true
+    initial_value: 1
+    min_value: 0
+    max_value: 3
+    step: 1
+    optimistic: true
+
+  - platform: template
+    name: "Default Voltage"
+    id: default_voltage
+    device_class: voltage
+    unit_of_measurement: "V"
+    restore_value: true
+    initial_value: ${fallback_voltage}
+    min_value: ${voltage_min}
+    max_value: ${voltage_max}
+    step: 0.1
+    optimistic: true
+
+sensor:
+  - platform: template
+    name: "Active Rectifiers"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: return id(active_rectifier_count);
+
+  - platform: template
+    name: "Discovered Rectifiers"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: return id(discovered_rectifier_count);
+
+  - platform: template
+    name: "Available Shelf Current"
+    device_class: current
+    state_class: measurement
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: |-
+      float fb = id(rect_max_current).state;
+      if (isnan(fb) || fb < 1.0f) fb = 26.8f;
+      float total = 0;
+      const uint32_t now = millis();
+      for (int i = 0; i < 4; i++) {
+        bool up = id(rectifier_valid)[i] && !id(park_active)[i] &&
+                  id(rectifier_last_seen_ms)[i] != 0 &&
+                  now - id(rectifier_last_seen_ms)[i] <= 3000;
+        if (up) total += (id(unit_max_a)[i] > 1.0f) ? id(unit_max_a)[i] : fb;
+      }
+      return total;
+
+  - platform: template
+    name: "Effective Shelf Current Limit"
+    device_class: current
+    state_class: measurement
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: return id(effective_shelf_current_limit);
+
+  - platform: template
+    name: "Allocated Current Per Rectifier"
+    device_class: current
+    state_class: measurement
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: return id(allocated_current_per_rectifier);
+
+  - platform: template
+    name: "Rectifier 1 Max Current"
+    device_class: current
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      return id(unit_max_a)[0] > 1.0f ? id(unit_max_a)[0] : NAN;
+
+  - platform: template
+    name: "Rectifier 2 Max Current"
+    device_class: current
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      return id(unit_max_a)[1] > 1.0f ? id(unit_max_a)[1] : NAN;
+
+  - platform: template
+    name: "Rectifier 3 Max Current"
+    device_class: current
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      return id(unit_max_a)[2] > 1.0f ? id(unit_max_a)[2] : NAN;
+
+  - platform: template
+    name: "Rectifier 4 Max Current"
+    device_class: current
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      return id(unit_max_a)[3] > 1.0f ? id(unit_max_a)[3] : NAN;
+
+  - platform: template
+    name: "Rectifier 1 Session Runtime"
+    unit_of_measurement: "h"
+    icon: mdi:clock-start
+    accuracy_decimals: 3
+    update_interval: 60s
+    lambda: return id(run_seconds)[0] / 3600.0f;
+
+  - platform: template
+    name: "Rectifier 2 Session Runtime"
+    unit_of_measurement: "h"
+    icon: mdi:clock-start
+    accuracy_decimals: 3
+    update_interval: 60s
+    lambda: return id(run_seconds)[1] / 3600.0f;
+
+  - platform: template
+    name: "Rectifier 3 Session Runtime"
+    unit_of_measurement: "h"
+    icon: mdi:clock-start
+    accuracy_decimals: 3
+    update_interval: 60s
+    lambda: return id(run_seconds)[2] / 3600.0f;
+
+  - platform: template
+    name: "Rectifier 4 Session Runtime"
+    unit_of_measurement: "h"
+    icon: mdi:clock-start
+    accuracy_decimals: 3
+    update_interval: 60s
+    lambda: return id(run_seconds)[3] / 3600.0f;
+
+  - platform: template
+    name: "Parked Rectifiers"
+    icon: mdi:sleep
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      int n = 0;
+      for (int i = 0; i < 4; i++) if (id(park_active)[i]) n++;
+      return n;
+
+  - platform: template
+    name: "Shelf Output Current"
+    device_class: current
+    state_class: measurement
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: |-
+      float total = 0;
+      const uint32_t now = millis();
+      for (int i = 0; i < 4; i++) {
+        if (id(rectifier_last_seen_ms)[i] != 0 &&
+            now - id(rectifier_last_seen_ms)[i] <= 3000) total += id(rectifier_iout)[i];
+      }
+      return total;
+
+  - platform: template
+    name: "Shelf Output Power"
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      float total = 0;
+      const uint32_t now = millis();
+      for (int i = 0; i < 4; i++) {
+        if (id(rectifier_last_seen_ms)[i] != 0 &&
+            now - id(rectifier_last_seen_ms)[i] <= 3000)
+          total += id(rectifier_iout)[i] * id(rectifier_vout)[i];
+      }
+      return total;
+
+  # Per-rectifier telemetry. Offline units publish unavailable (NaN).
+  - platform: template
+    name: "Rectifier 1 Output Current"
+    device_class: current
+    state_class: measurement
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: |-
+      return id(rectifier_was_online)[0] ? id(rectifier_iout)[0] : NAN;
+  - platform: template
+    name: "Rectifier 2 Output Current"
+    device_class: current
+    state_class: measurement
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: |-
+      return id(rectifier_was_online)[1] ? id(rectifier_iout)[1] : NAN;
+  - platform: template
+    name: "Rectifier 3 Output Current"
+    device_class: current
+    state_class: measurement
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: |-
+      return id(rectifier_was_online)[2] ? id(rectifier_iout)[2] : NAN;
+  - platform: template
+    name: "Rectifier 4 Output Current"
+    device_class: current
+    state_class: measurement
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: |-
+      return id(rectifier_was_online)[3] ? id(rectifier_iout)[3] : NAN;
+
+  - platform: template
+    name: "Rectifier 1 Output Voltage"
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    update_interval: 1s
+    lambda: |-
+      const float value = id(rectifier_vout)[0];
+      return id(rectifier_was_online)[0] && value >= 40.0f && value <= 60.0f ? value : NAN;
+  - platform: template
+    name: "Rectifier 2 Output Voltage"
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    update_interval: 1s
+    lambda: |-
+      const float value = id(rectifier_vout)[1];
+      return id(rectifier_was_online)[1] && value >= 40.0f && value <= 60.0f ? value : NAN;
+  - platform: template
+    name: "Rectifier 3 Output Voltage"
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    update_interval: 1s
+    lambda: |-
+      const float value = id(rectifier_vout)[2];
+      return id(rectifier_was_online)[2] && value >= 40.0f && value <= 60.0f ? value : NAN;
+  - platform: template
+    name: "Rectifier 4 Output Voltage"
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    update_interval: 1s
+    lambda: |-
+      const float value = id(rectifier_vout)[3];
+      return id(rectifier_was_online)[3] && value >= 40.0f && value <= 60.0f ? value : NAN;
+
+  - platform: template
+    name: "Rectifier 1 Input Voltage"
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      const float value = id(rectifier_vin)[0];
+      return id(rectifier_was_online)[0] && value >= 80.0f && value <= 300.0f ? value : NAN;
+  - platform: template
+    name: "Rectifier 2 Input Voltage"
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      const float value = id(rectifier_vin)[1];
+      return id(rectifier_was_online)[1] && value >= 80.0f && value <= 300.0f ? value : NAN;
+  - platform: template
+    name: "Rectifier 3 Input Voltage"
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      const float value = id(rectifier_vin)[2];
+      return id(rectifier_was_online)[2] && value >= 80.0f && value <= 300.0f ? value : NAN;
+  - platform: template
+    name: "Rectifier 4 Input Voltage"
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      const float value = id(rectifier_vin)[3];
+      return id(rectifier_was_online)[3] && value >= 80.0f && value <= 300.0f ? value : NAN;
+
+  - platform: template
+    name: "Rectifier 1 Inlet Temperature"
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      return id(rectifier_was_online)[0] ? id(rectifier_temp_inlet)[0] : NAN;
+  - platform: template
+    name: "Rectifier 2 Inlet Temperature"
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      return id(rectifier_was_online)[1] ? id(rectifier_temp_inlet)[1] : NAN;
+  - platform: template
+    name: "Rectifier 3 Inlet Temperature"
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      return id(rectifier_was_online)[2] ? id(rectifier_temp_inlet)[2] : NAN;
+  - platform: template
+    name: "Rectifier 4 Inlet Temperature"
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      return id(rectifier_was_online)[3] ? id(rectifier_temp_inlet)[3] : NAN;
+
+  - platform: template
+    name: "Rectifier 1 Outlet Temperature"
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      return id(rectifier_was_online)[0] ? id(rectifier_temp_outlet)[0] : NAN;
+  - platform: template
+    name: "Rectifier 2 Outlet Temperature"
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      return id(rectifier_was_online)[1] ? id(rectifier_temp_outlet)[1] : NAN;
+  - platform: template
+    name: "Rectifier 3 Outlet Temperature"
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      return id(rectifier_was_online)[2] ? id(rectifier_temp_outlet)[2] : NAN;
+  - platform: template
+    name: "Rectifier 4 Outlet Temperature"
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      return id(rectifier_was_online)[3] ? id(rectifier_temp_outlet)[3] : NAN;
+
+binary_sensor:
+  - platform: template
+    name: "Rectifier 1 Parked"
+    icon: mdi:sleep
+    lambda: return id(park_active)[0];
+  - platform: template
+    name: "Rectifier 2 Parked"
+    icon: mdi:sleep
+    lambda: return id(park_active)[1];
+  - platform: template
+    name: "Rectifier 3 Parked"
+    icon: mdi:sleep
+    lambda: return id(park_active)[2];
+  - platform: template
+    name: "Rectifier 4 Parked"
+    icon: mdi:sleep
+    lambda: return id(park_active)[3];
+  - platform: template
+    name: "Rectifier 1 Online"
+    lambda: return id(rectifier_was_online)[0];
+  - platform: template
+    name: "Rectifier 2 Online"
+    lambda: return id(rectifier_was_online)[1];
+  - platform: template
+    name: "Rectifier 3 Online"
+    lambda: return id(rectifier_was_online)[2];
+  - platform: template
+    name: "Rectifier 4 Online"
+    lambda: return id(rectifier_was_online)[3];
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "ESP IP Address"
+    ssid:
+      name: "ESP Connected SSID"
+
+  - platform: template
+    name: "Efficiency State"
+    icon: mdi:leaf
+    update_interval: 5s
+    lambda: |-
+      if (!id(efficiency_enabled).state) return {"Disabled"};
+      if (id(trans_phase) == 1) {
+        char b[48];
+        snprintf(b, sizeof(b), "Rotating, parking %d shortly", id(trans_out) + 1);
+        return {b};
+      }
+      // Count units actually in comms, not merely remembered. rectifier_valid
+      // persists for a discovered serial even after the shelf is powered down,
+      // so counting it reported "2 running" with nothing on the bus at all.
+      const uint32_t now = millis();
+      int parked = 0, run = 0;
+      for (int i = 0; i < 4; i++) {
+        if (!id(rectifier_valid)[i]) continue;
+        if (id(rectifier_last_seen_ms)[i] == 0 ||
+            now - id(rectifier_last_seen_ms)[i] > 3000) continue;
+        if (id(park_active)[i]) parked++; else run++;
+      }
+      if (run + parked == 0) return {"No rectifiers"};
+      char b[48];
+      snprintf(b, sizeof(b), "%d running, %d parked", run, parked);
+      return {b};
+
+  - platform: template
+    name: "Rectifier 1 Serial"
+    update_interval: 5s
+    lambda: |-
+      if (!id(rectifier_valid)[0]) return {"Not discovered"};
+      if (id(rectifier_adopted)[0]) return {"Adopted, serial unknown"};
+      char buf[24];
+      snprintf(buf, sizeof(buf), "%02X%02X%02X%02X%02X%02X",
+        id(rectifier_serial)[0], id(rectifier_serial)[1],
+        id(rectifier_serial)[2], id(rectifier_serial)[3],
+        id(rectifier_serial)[4], id(rectifier_serial)[5]);
+      return {buf};
+  - platform: template
+    name: "Rectifier 2 Serial"
+    update_interval: 5s
+    lambda: |-
+      if (!id(rectifier_valid)[1]) return {"Not discovered"};
+      if (id(rectifier_adopted)[1]) return {"Adopted, serial unknown"};
+      char buf[24];
+      snprintf(buf, sizeof(buf), "%02X%02X%02X%02X%02X%02X",
+        id(rectifier_serial)[8], id(rectifier_serial)[9],
+        id(rectifier_serial)[10], id(rectifier_serial)[11],
+        id(rectifier_serial)[12], id(rectifier_serial)[13]);
+      return {buf};
+  - platform: template
+    name: "Rectifier 3 Serial"
+    update_interval: 5s
+    lambda: |-
+      if (!id(rectifier_valid)[2]) return {"Not discovered"};
+      if (id(rectifier_adopted)[2]) return {"Adopted, serial unknown"};
+      char buf[24];
+      snprintf(buf, sizeof(buf), "%02X%02X%02X%02X%02X%02X",
+        id(rectifier_serial)[16], id(rectifier_serial)[17],
+        id(rectifier_serial)[18], id(rectifier_serial)[19],
+        id(rectifier_serial)[20], id(rectifier_serial)[21]);
+      return {buf};
+  - platform: template
+    name: "Rectifier 4 Serial"
+    update_interval: 5s
+    lambda: |-
+      if (!id(rectifier_valid)[3]) return {"Not discovered"};
+      if (id(rectifier_adopted)[3]) return {"Adopted, serial unknown"};
+      char buf[24];
+      snprintf(buf, sizeof(buf), "%02X%02X%02X%02X%02X%02X",
+        id(rectifier_serial)[24], id(rectifier_serial)[25],
+        id(rectifier_serial)[26], id(rectifier_serial)[27],
+        id(rectifier_serial)[28], id(rectifier_serial)[29]);
+      return {buf};
+
+  - platform: template
+    name: "Rectifier 1 Faults"
+    icon: mdi:alert-circle-outline
+    update_interval: 5s
+    lambda: |-
+      // Names taken from Eltek's own PowerSuite "Detailed rectifier status"
+      // table, which lists 16 distinct fields in bit order. The widely-copied
+      // community protocol note is wrong for byte 2: it repeats "Mod Fail
+      // Secondary" (already byte 1 bit 2) and omits "Low Output Volt".
+      // Byte 1 is confirmed empirically - commanding a current limit sets
+      // exactly bit 7 and nothing else.
+      static const char *NAMES[16] = {
+        "OVS Lock Out", "Mod Fail Primary", "Mod Fail Secondary", "High Mains",
+        "Low Mains", "High Temp", "Low Temp", "Current Limit",
+        "Internal Voltage", "Module Fail", "Fan 1 Speed Low", "Fan 2 Speed Low",
+        "Low Output Volt", "Sub Mod1 Fail", "Fan 3 Speed Low", "Inner Volt"};
+      if (!id(rectifier_was_online)[0]) return {"Offline"};
+      std::string out;
+      const uint16_t a = id(rectifier_alarm_bits)[0];
+      const uint16_t w = id(rectifier_warn_bits)[0];
+      for (int b = 0; b < 16; b++)
+        if (a & (1 << b)) { if (!out.empty()) out += ", "; out += "ALARM "; out += NAMES[b]; }
+      for (int b = 0; b < 16; b++)
+        if (w & (1 << b)) { if (!out.empty()) out += ", "; out += NAMES[b]; }
+      if (out.empty()) return {"None"};
+      if (out.size() > 250) out.resize(250);
+      return {out};
+  - platform: template
+    name: "Rectifier 2 Faults"
+    icon: mdi:alert-circle-outline
+    update_interval: 5s
+    lambda: |-
+      // Names taken from Eltek's own PowerSuite "Detailed rectifier status"
+      // table, which lists 16 distinct fields in bit order. The widely-copied
+      // community protocol note is wrong for byte 2: it repeats "Mod Fail
+      // Secondary" (already byte 1 bit 2) and omits "Low Output Volt".
+      // Byte 1 is confirmed empirically - commanding a current limit sets
+      // exactly bit 7 and nothing else.
+      static const char *NAMES[16] = {
+        "OVS Lock Out", "Mod Fail Primary", "Mod Fail Secondary", "High Mains",
+        "Low Mains", "High Temp", "Low Temp", "Current Limit",
+        "Internal Voltage", "Module Fail", "Fan 1 Speed Low", "Fan 2 Speed Low",
+        "Low Output Volt", "Sub Mod1 Fail", "Fan 3 Speed Low", "Inner Volt"};
+      if (!id(rectifier_was_online)[1]) return {"Offline"};
+      std::string out;
+      const uint16_t a = id(rectifier_alarm_bits)[1];
+      const uint16_t w = id(rectifier_warn_bits)[1];
+      for (int b = 0; b < 16; b++)
+        if (a & (1 << b)) { if (!out.empty()) out += ", "; out += "ALARM "; out += NAMES[b]; }
+      for (int b = 0; b < 16; b++)
+        if (w & (1 << b)) { if (!out.empty()) out += ", "; out += NAMES[b]; }
+      if (out.empty()) return {"None"};
+      if (out.size() > 250) out.resize(250);
+      return {out};
+  - platform: template
+    name: "Rectifier 3 Faults"
+    icon: mdi:alert-circle-outline
+    update_interval: 5s
+    lambda: |-
+      // Names taken from Eltek's own PowerSuite "Detailed rectifier status"
+      // table, which lists 16 distinct fields in bit order. The widely-copied
+      // community protocol note is wrong for byte 2: it repeats "Mod Fail
+      // Secondary" (already byte 1 bit 2) and omits "Low Output Volt".
+      // Byte 1 is confirmed empirically - commanding a current limit sets
+      // exactly bit 7 and nothing else.
+      static const char *NAMES[16] = {
+        "OVS Lock Out", "Mod Fail Primary", "Mod Fail Secondary", "High Mains",
+        "Low Mains", "High Temp", "Low Temp", "Current Limit",
+        "Internal Voltage", "Module Fail", "Fan 1 Speed Low", "Fan 2 Speed Low",
+        "Low Output Volt", "Sub Mod1 Fail", "Fan 3 Speed Low", "Inner Volt"};
+      if (!id(rectifier_was_online)[2]) return {"Offline"};
+      std::string out;
+      const uint16_t a = id(rectifier_alarm_bits)[2];
+      const uint16_t w = id(rectifier_warn_bits)[2];
+      for (int b = 0; b < 16; b++)
+        if (a & (1 << b)) { if (!out.empty()) out += ", "; out += "ALARM "; out += NAMES[b]; }
+      for (int b = 0; b < 16; b++)
+        if (w & (1 << b)) { if (!out.empty()) out += ", "; out += NAMES[b]; }
+      if (out.empty()) return {"None"};
+      if (out.size() > 250) out.resize(250);
+      return {out};
+  - platform: template
+    name: "Rectifier 4 Faults"
+    icon: mdi:alert-circle-outline
+    update_interval: 5s
+    lambda: |-
+      // Names taken from Eltek's own PowerSuite "Detailed rectifier status"
+      // table, which lists 16 distinct fields in bit order. The widely-copied
+      // community protocol note is wrong for byte 2: it repeats "Mod Fail
+      // Secondary" (already byte 1 bit 2) and omits "Low Output Volt".
+      // Byte 1 is confirmed empirically - commanding a current limit sets
+      // exactly bit 7 and nothing else.
+      static const char *NAMES[16] = {
+        "OVS Lock Out", "Mod Fail Primary", "Mod Fail Secondary", "High Mains",
+        "Low Mains", "High Temp", "Low Temp", "Current Limit",
+        "Internal Voltage", "Module Fail", "Fan 1 Speed Low", "Fan 2 Speed Low",
+        "Low Output Volt", "Sub Mod1 Fail", "Fan 3 Speed Low", "Inner Volt"};
+      if (!id(rectifier_was_online)[3]) return {"Offline"};
+      std::string out;
+      const uint16_t a = id(rectifier_alarm_bits)[3];
+      const uint16_t w = id(rectifier_warn_bits)[3];
+      for (int b = 0; b < 16; b++)
+        if (a & (1 << b)) { if (!out.empty()) out += ", "; out += "ALARM "; out += NAMES[b]; }
+      for (int b = 0; b < 16; b++)
+        if (w & (1 << b)) { if (!out.empty()) out += ", "; out += NAMES[b]; }
+      if (out.empty()) return {"None"};
+      if (out.size() > 250) out.resize(250);
+      return {out};
+  - platform: template
+    name: "Rectifier 1 State"
+    update_interval: 1s
+    lambda: |-
+      if (!id(rectifier_was_online)[0]) return {"Offline"};
+      // A parked unit reports 0x10 (walk-in) continuously for as long as
+      // it is held at the park voltage - bench-confirmed 2026-08-30. Report
+      // the park explicitly so the dashboard does not show a permanent
+      // "Walk-in" for a unit that is simply asleep.
+      if (id(park_active)[0]) return {"Parked"};
+      switch (id(rectifier_state)[0]) {
+        case 0x04: return {"Normal"};
+        case 0x08:
+          // 0x08 only means "some warning bit is set". Bit 7 is Current Limit,
+          // which is the unit obeying the limit we gave it - normal constant-
+          // current operation, not a fault. Only call it a warning if some
+          // other bit is set (or we have not read the bits back yet).
+          if (id(rectifier_warn_bits)[0] == 0x0080) return {"Constant current"};
+          return {"Warning"};
+        case 0x0C: return {"Alarm"};
+        case 0x10: return {"Walk-in"};
+        default: return {"Unknown"};
+      }
+  - platform: template
+    name: "Rectifier 2 State"
+    update_interval: 1s
+    lambda: |-
+      if (!id(rectifier_was_online)[1]) return {"Offline"};
+      // A parked unit reports 0x10 (walk-in) continuously for as long as
+      // it is held at the park voltage - bench-confirmed 2026-08-30. Report
+      // the park explicitly so the dashboard does not show a permanent
+      // "Walk-in" for a unit that is simply asleep.
+      if (id(park_active)[1]) return {"Parked"};
+      switch (id(rectifier_state)[1]) {
+        case 0x04: return {"Normal"};
+        case 0x08:
+          // 0x08 only means "some warning bit is set". Bit 7 is Current Limit,
+          // which is the unit obeying the limit we gave it - normal constant-
+          // current operation, not a fault. Only call it a warning if some
+          // other bit is set (or we have not read the bits back yet).
+          if (id(rectifier_warn_bits)[1] == 0x0080) return {"Constant current"};
+          return {"Warning"};
+        case 0x0C: return {"Alarm"};
+        case 0x10: return {"Walk-in"};
+        default: return {"Unknown"};
+      }
+  - platform: template
+    name: "Rectifier 3 State"
+    update_interval: 1s
+    lambda: |-
+      if (!id(rectifier_was_online)[2]) return {"Offline"};
+      // A parked unit reports 0x10 (walk-in) continuously for as long as
+      // it is held at the park voltage - bench-confirmed 2026-08-30. Report
+      // the park explicitly so the dashboard does not show a permanent
+      // "Walk-in" for a unit that is simply asleep.
+      if (id(park_active)[2]) return {"Parked"};
+      switch (id(rectifier_state)[2]) {
+        case 0x04: return {"Normal"};
+        case 0x08:
+          // 0x08 only means "some warning bit is set". Bit 7 is Current Limit,
+          // which is the unit obeying the limit we gave it - normal constant-
+          // current operation, not a fault. Only call it a warning if some
+          // other bit is set (or we have not read the bits back yet).
+          if (id(rectifier_warn_bits)[2] == 0x0080) return {"Constant current"};
+          return {"Warning"};
+        case 0x0C: return {"Alarm"};
+        case 0x10: return {"Walk-in"};
+        default: return {"Unknown"};
+      }
+  - platform: template
+    name: "Rectifier 4 State"
+    update_interval: 1s
+    lambda: |-
+      if (!id(rectifier_was_online)[3]) return {"Offline"};
+      // A parked unit reports 0x10 (walk-in) continuously for as long as
+      // it is held at the park voltage - bench-confirmed 2026-08-30. Report
+      // the park explicitly so the dashboard does not show a permanent
+      // "Walk-in" for a unit that is simply asleep.
+      if (id(park_active)[3]) return {"Parked"};
+      switch (id(rectifier_state)[3]) {
+        case 0x04: return {"Normal"};
+        case 0x08:
+          // 0x08 only means "some warning bit is set". Bit 7 is Current Limit,
+          // which is the unit obeying the limit we gave it - normal constant-
+          // current operation, not a fault. Only call it a warning if some
+          // other bit is set (or we have not read the bits back yet).
+          if (id(rectifier_warn_bits)[3] == 0x0080) return {"Constant current"};
+          return {"Warning"};
+        case 0x0C: return {"Alarm"};
+        case 0x10: return {"Walk-in"};
+        default: return {"Unknown"};
+      }
+
+switch:
+  # Observe mode: mute EVERY transmission - allocator broadcast, login refresh,
+  # discovery login, fault queries and the default-voltage write - so this
+  # controller can sit on a bus that another master (a Smartpack controller) is
+  # driving, without fighting it for addressing or setpoints. Receive and decode
+  # continue normally. State is restored across reboot so a controller already
+  # placed in observe mode cannot transmit during its next boot. First boot
+  # defaults OFF, preserving the active-controller default.
+  - platform: template
+    name: "Observe Mode"
+    id: observe_mode
+    entity_category: diagnostic
+    icon: mdi:eye-outline
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # ON  = one shelf-wide setpoint, broadcast on 0x05FF4004 (proven to work).
+  # OFF = broadcast suppressed so per-unit frames can be tested; use the
+  #       "Apply Per-Unit Setpoints" button to send them.
+  - platform: template
+    name: "Sync Setpoints"
+    id: sync_setpoints
+    icon: mdi:link-variant
+    optimistic: true
+    restore_mode: ALWAYS_ON
+
+  # Efficiency manager: parks surplus rectifiers and rotates which ones run.
+  # Defaults OFF - it must be switched on deliberately - but the choice sticks
+  # once made. RESTORE_DEFAULT_OFF keeps the saved state in NVS, which survives
+  # both reboots and OTA updates, so a shelf left managing itself resumes doing
+  # so after a power cut or a firmware push. Only a flash erase (a first serial
+  # install, or esptool erase_flash) clears it, which is the one case that
+  # genuinely is a fresh install.
+  #
+  # Caveat: the preference is keyed on a hash of this entity's name, so
+  # renaming "Efficiency Manager Enabled" orphans the stored value and the
+  # switch silently comes back OFF. Safe direction to fail, but worth knowing.
+  - platform: template
+    name: "Efficiency Manager Enabled"
+    id: efficiency_enabled
+    icon: mdi:leaf
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # Keep one more rectifier running than strictly needed.
+  - platform: template
+    name: "Efficiency Redundancy"
+    id: efficiency_redundancy
+    icon: mdi:shield-plus
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+  # Diagnostic: log every received CAN frame, including ones the normal
+  # handlers discard. Read-only - it never transmits - and defaults off
+  # because it is chatty (each PSU reports about ten times a second).
+  - platform: template
+    name: "CAN Sniffer Enabled"
+    id: can_sniffer_enabled
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+
+  # Diagnostic: log this controller's own park/release transmissions. The CAN
+  # sniffer above is an on_frame trigger and shows RECEIVED frames only, so
+  # without this there is no record of what we actually sent. Off by default.
+  - platform: template
+    name: "TX Log Enabled"
+    id: tx_log_enabled
+    entity_category: diagnostic
+    icon: mdi:upload-network-outline
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+
+button:
+  - platform: template
+    name: "Write Default Voltage To Discovered Rectifiers"
+    icon: mdi:content-save
+    on_press:
+      then:
+        - lambda: |-
+            if (id(observe_mode).state) {
+              ESP_LOGW("eltek", "Observe mode is on - default voltage NOT written");
+              return;
+            }
+            float volts = id(default_voltage).state;
+            if (isnan(volts)) return;
+            const uint16_t u100 = (uint16_t) lroundf(volts * 100.0f);
+            std::vector<uint8_t> data = {
+              0x29, 0x15, 0x00,
+              (uint8_t) (u100 & 0xFF), (uint8_t) (u100 >> 8)
+            };
+            // Refresh every login first, then write once: like the set-output
+            // frame, the default-voltage write is only honoured on the
+            // unit-byte-zero form, so it reaches all logged-in rectifiers.
+            for (int slot = 0; slot < 4; slot++) {
+              if (!id(rectifier_valid)[slot] || id(rectifier_adopted)[slot]) continue;
+              std::vector<uint8_t> login(
+                &id(rectifier_serial)[slot * 8], &id(rectifier_serial)[slot * 8] + 8);
+              id(eltek).send_data(
+                0x05004800 | ((slot + 1) * 4), true, login);
+            }
+            id(eltek).send_data(0x05009C00, true, data);
+            ESP_LOGW("eltek", "Wrote %.2f V default to all discovered rectifiers", volts);
+
+  - platform: template
+    name: "Apply Per-Unit Setpoints"
+    icon: mdi:tune-vertical
+    on_press:
+      then:
+        - lambda: |-
+            // One-shot on purpose: method 2 writes the rectifier's EEPROM, and
+            // repeating that at the allocator's 1 Hz would wear its flash out.
+            if (id(observe_mode).state) {
+              ESP_LOGW("eltek", "Observe mode on - per-unit setpoints NOT sent");
+              return;
+            }
+            if (id(sync_setpoints).state) {
+              ESP_LOGW("eltek", "Sync Setpoints is on - turn it off first, or the "
+                                "next broadcast overwrites these values");
+              return;
+            }
+            const int method = (int) lroundf(id(per_unit_method).state);
+            const uint16_t ovp = (uint16_t) lroundf(${ovp_voltage}f * 100.0f);
+            for (int slot = 0; slot < 4; slot++) {
+              if (!id(rectifier_valid)[slot]) continue;
+              float volts = 48.0f;
+              switch (slot) {
+                case 0: volts = id(rect_1_voltage).state; break;
+                case 1: volts = id(rect_2_voltage).state; break;
+                case 2: volts = id(rect_3_voltage).state; break;
+                case 3: volts = id(rect_4_voltage).state; break;
+              }
+              if (isnan(volts)) continue;
+              const uint16_t u100 = (uint16_t) lroundf(volts * 100.0f);
+              const uint8_t lo = u100 & 0xFF, hi = u100 >> 8;
+              const uint32_t unit = slot + 1;
+              uint32_t id_ = 0;
+              std::vector<uint8_t> data;
+              switch (method) {
+                case 0:
+                  id_ = 0x05004004 | (unit << 16);
+                  data = {0xFF, 0xFF, lo, hi, lo, hi,
+                          (uint8_t) (ovp & 0xFF), (uint8_t) (ovp >> 8)};
+                  break;
+                case 1:
+                  id_ = 0x05009FFC | (unit << 16);
+                  data = {0x29, 0x01, 0x00, lo, hi};
+                  break;
+                case 2:
+                  id_ = 0x05009C00 | (unit << 16);
+                  data = {0x29, 0x15, 0x00, lo, hi};
+                  break;
+                default:
+                  id_ = 0x05009800 | (unit << 16);
+                  data = {0x21, 0x00, 0x00, lo, hi};
+                  break;
+              }
+              id(eltek).send_data(id_, true, data);
+              ESP_LOGW("eltek", "per-unit method %d: sent 0x%08X %.2f V to unit %d",
+                       method, id_, volts, (int) unit);
+            }
+
+  - platform: template
+    name: "Sweep Parameters"
+    icon: mdi:magnify-expand
+    entity_category: diagnostic
+    on_press:
+      then:
+        - lambda: |-
+            static const uint16_t FUNCS[6] = {0x9800, 0x9804, 0x9C00, 0x9FFC, 0xBC00, 0xBFFC};
+            if (id(observe_mode).state) {
+              ESP_LOGW("sweep", "observe mode on - not sending");
+              return;
+            }
+            const int op = (int) lroundf(id(probe_op).state);
+            if (op & 1) {
+              ESP_LOGW("sweep", "op 0x%02X is odd (a write) - refusing", op);
+              return;
+            }
+            const int unit = (int) lroundf(id(probe_unit).state);
+            int fi = (int) lroundf(id(probe_function).state);
+            if (fi < 0 || fi > 5) fi = 3;
+            const uint32_t can_id = 0x05000000 | (unit << 16) | FUNCS[fi];
+            ESP_LOGW("sweep", "sweeping 0x%08X op 0x%02X selectors 0x00-0x1F", can_id, op);
+            for (int sel = 0; sel <= 0x1F; sel++) {
+              std::vector<uint8_t> req = {(uint8_t) op, (uint8_t) sel, 0x00};
+              id(eltek).send_data(can_id, true, req);
+            }
+
+  - platform: template
+    name: "Shuffle Now"
+    icon: mdi:rotate-3d-variant
+    on_press:
+      then:
+        - lambda: |-
+            if (!id(efficiency_enabled).state) {
+              ESP_LOGW("eltek", "Shuffle Now ignored - efficiency manager is off");
+              return;
+            }
+            id(force_shuffle) = true;
+            ESP_LOGW("eltek", "Shuffle Now: rotation will start on the next tick");
+
+  - platform: restart
+    name: "Restart"

@@ -1,0 +1,26 @@
+# Keep this repository deliberately curated: the workspace also contains live
+# snapshots, credentials, large raw captures, vendor binaries, and caches.
+*
+!.gitignore
+!LICENSE
+!README.md
+!CHANGELOG.md
+!esphome/
+!esphome/m5stack-eltek-shelf.yaml
+!esphome/secrets.example.yaml
+!docs/
+!docs/INSTALLATION.md
+!docs/PROTOCOL.md
+!examples/
+!examples/home-assistant/
+!examples/home-assistant/eltek-shelf-package.yaml
+!examples/home-assistant/eltek-shelf-automations.yaml
+!examples/home-assistant/lovelace-eltek-shelf.yaml
+!evidence/
+!evidence/README.md
+!evidence/three-rectifier-efficiency-anonymized.csv
+
+# Never publish real ESPHome credentials.
+**/secrets.yaml
+**/.esphome/
+**/__pycache__/

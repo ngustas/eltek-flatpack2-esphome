@@ -1,0 +1,105 @@
+# Optional bidirectional helpers for entering values in box-mode controls.
+# Add these list items to automations.yaml. The default ESPHome device slug is
+# used; update it to match Settings -> Devices & services -> Entities.
+
+- id: eltek_shelf_apply_float_voltage
+  alias: Eltek Shelf Apply Float Voltage
+  triggers:
+    - trigger: state
+      entity_id: input_number.eltek_shelf_float_voltage_setpoint_input
+  conditions:
+    - condition: template
+      value_template: "{{ trigger.to_state.state | is_number }}"
+  actions:
+    - action: number.set_value
+      target:
+        entity_id: number.m5stack_eltek_shelf_voltage_setpoint
+      data:
+        value: "{{ trigger.to_state.state | float }}"
+  mode: restart
+
+- id: eltek_shelf_apply_current_limit
+  alias: Eltek Shelf Apply Current Limit
+  triggers:
+    - trigger: state
+      entity_id: input_number.eltek_shelf_current_limit_input
+  conditions:
+    - condition: template
+      value_template: "{{ trigger.to_state.state | is_number }}"
+  actions:
+    - action: number.set_value
+      target:
+        entity_id: number.m5stack_eltek_shelf_shelf_current_limit
+      data:
+        value: "{{ trigger.to_state.state | float }}"
+  mode: restart
+
+- id: eltek_shelf_apply_default_voltage
+  alias: Eltek Shelf Apply Fallback Default Voltage
+  triggers:
+    - trigger: state
+      entity_id: input_number.eltek_shelf_default_voltage_input
+  conditions:
+    - condition: template
+      value_template: "{{ trigger.to_state.state | is_number }}"
+  actions:
+    - action: number.set_value
+      target:
+        entity_id: number.m5stack_eltek_shelf_default_voltage
+      data:
+        value: "{{ trigger.to_state.state | float }}"
+  mode: restart
+
+- id: eltek_shelf_sync_float_voltage
+  alias: Eltek Shelf Sync Float Voltage
+  triggers:
+    - trigger: homeassistant
+      event: start
+    - trigger: state
+      entity_id: number.m5stack_eltek_shelf_voltage_setpoint
+  conditions:
+    - condition: template
+      value_template: "{{ states('number.m5stack_eltek_shelf_voltage_setpoint') | is_number }}"
+  actions:
+    - action: input_number.set_value
+      target:
+        entity_id: input_number.eltek_shelf_float_voltage_setpoint_input
+      data:
+        value: "{{ states('number.m5stack_eltek_shelf_voltage_setpoint') | float }}"
+  mode: restart
+
+- id: eltek_shelf_sync_current_limit
+  alias: Eltek Shelf Sync Current Limit
+  triggers:
+    - trigger: homeassistant
+      event: start
+    - trigger: state
+      entity_id: number.m5stack_eltek_shelf_shelf_current_limit
+  conditions:
+    - condition: template
+      value_template: "{{ states('number.m5stack_eltek_shelf_shelf_current_limit') | is_number }}"
+  actions:
+    - action: input_number.set_value
+      target:
+        entity_id: input_number.eltek_shelf_current_limit_input
+      data:
+        value: "{{ states('number.m5stack_eltek_shelf_shelf_current_limit') | float }}"
+  mode: restart
+
+- id: eltek_shelf_sync_default_voltage
+  alias: Eltek Shelf Sync Fallback Default Voltage
+  triggers:
+    - trigger: homeassistant
+      event: start
+    - trigger: state
+      entity_id: number.m5stack_eltek_shelf_default_voltage
+  conditions:
+    - condition: template
+      value_template: "{{ states('number.m5stack_eltek_shelf_default_voltage') | is_number }}"
+  actions:
+    - action: input_number.set_value
+      target:
+        entity_id: input_number.eltek_shelf_default_voltage_input
+      data:
+        value: "{{ states('number.m5stack_eltek_shelf_default_voltage') | float }}"
+  mode: restart

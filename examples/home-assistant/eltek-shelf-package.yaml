@@ -1,0 +1,102 @@
+# Optional Home Assistant package for the default ESPHome device name.
+# Adjust entity IDs if Home Assistant retained an older/custom device slug.
+
+input_number:
+  eltek_shelf_float_voltage_setpoint_input:
+    name: Eltek Shelf Float Voltage Setpoint
+    min: 43.7
+    max: 57.6
+    step: 0.1
+    mode: box
+    unit_of_measurement: V
+    icon: mdi:sine-wave
+
+  eltek_shelf_current_limit_input:
+    name: Eltek Shelf Current Limit
+    min: 0
+    max: 170
+    step: 0.1
+    mode: box
+    unit_of_measurement: A
+    icon: mdi:current-dc
+
+  eltek_shelf_default_voltage_input:
+    name: Eltek Shelf Fallback Default Voltage
+    min: 43.7
+    max: 57.6
+    step: 0.1
+    mode: box
+    unit_of_measurement: V
+    icon: mdi:content-save
+
+  # Persistent records for serial-bound rotation totals. These helpers retain
+  # values across controller reflashes. An automation must map each discovered
+  # serial to one record and increment it only while that unit is carrying.
+  eltek_shelf_runtime_hours_1:
+    name: Eltek Shelf Runtime Hours 1
+    min: 0
+    max: 200000
+    step: 0.01
+    mode: box
+    unit_of_measurement: h
+    icon: mdi:clock-outline
+  eltek_shelf_runtime_hours_2:
+    name: Eltek Shelf Runtime Hours 2
+    min: 0
+    max: 200000
+    step: 0.01
+    mode: box
+    unit_of_measurement: h
+    icon: mdi:clock-outline
+  eltek_shelf_runtime_hours_3:
+    name: Eltek Shelf Runtime Hours 3
+    min: 0
+    max: 200000
+    step: 0.01
+    mode: box
+    unit_of_measurement: h
+    icon: mdi:clock-outline
+  eltek_shelf_runtime_hours_4:
+    name: Eltek Shelf Runtime Hours 4
+    min: 0
+    max: 200000
+    step: 0.01
+    mode: box
+    unit_of_measurement: h
+    icon: mdi:clock-outline
+
+input_text:
+  eltek_shelf_runtime_serial_1:
+    name: Eltek Shelf Runtime Serial 1
+    max: 20
+    icon: mdi:identifier
+  eltek_shelf_runtime_serial_2:
+    name: Eltek Shelf Runtime Serial 2
+    max: 20
+    icon: mdi:identifier
+  eltek_shelf_runtime_serial_3:
+    name: Eltek Shelf Runtime Serial 3
+    max: 20
+    icon: mdi:identifier
+  eltek_shelf_runtime_serial_4:
+    name: Eltek Shelf Runtime Serial 4
+    max: 20
+    icon: mdi:identifier
+
+input_boolean:
+  eltek_shelf_runtime_edit_unlock:
+    name: Eltek Shelf Runtime Edit Unlock
+    icon: mdi:lock-open-variant
+
+template:
+  - trigger:
+      - platform: state
+        entity_id: input_number.eltek_shelf_current_limit_input
+    sensor:
+      - name: Eltek Shelf Current Limit History
+        unique_id: eltek_shelf_current_limit_history
+        unit_of_measurement: A
+        device_class: current
+        state_class: measurement
+        availability: "{{ states('input_number.eltek_shelf_current_limit_input') | is_number }}"
+        state: "{{ states('input_number.eltek_shelf_current_limit_input') | float }}"

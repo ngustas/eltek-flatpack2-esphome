@@ -1,0 +1,59 @@
+# Manual Lovelace card using the default ESPHome device slug.
+type: vertical-stack
+cards:
+  - type: entities
+    title: Eltek shelf output
+    entities:
+      - input_number.eltek_shelf_float_voltage_setpoint_input
+      - input_number.eltek_shelf_current_limit_input
+      - sensor.m5stack_eltek_shelf_effective_shelf_current_limit
+      - sensor.m5stack_eltek_shelf_allocated_current_per_rectifier
+      - sensor.m5stack_eltek_shelf_shelf_output_current
+      - sensor.m5stack_eltek_shelf_shelf_output_power
+      - sensor.m5stack_eltek_shelf_available_shelf_current
+
+  - type: entities
+    title: Efficiency and redundancy
+    entities:
+      - switch.m5stack_eltek_shelf_efficiency_manager_enabled
+      - switch.m5stack_eltek_shelf_efficiency_redundancy
+      - sensor.m5stack_eltek_shelf_efficiency_state
+      - sensor.m5stack_eltek_shelf_active_rectifiers
+      - sensor.m5stack_eltek_shelf_parked_rectifiers
+      - number.m5stack_eltek_shelf_shuffle_time_hours
+      - number.m5stack_eltek_shelf_transition_time_minutes
+      - number.m5stack_eltek_shelf_park_voltage
+      - button.m5stack_eltek_shelf_shuffle_now
+
+  - type: entities
+    title: Rectifier state
+    entities:
+      - sensor.m5stack_eltek_shelf_rectifier_1_state
+      - sensor.m5stack_eltek_shelf_rectifier_1_faults
+      - sensor.m5stack_eltek_shelf_rectifier_1_output_current
+      - binary_sensor.m5stack_eltek_shelf_rectifier_1_parked
+      - type: divider
+      - sensor.m5stack_eltek_shelf_rectifier_2_state
+      - sensor.m5stack_eltek_shelf_rectifier_2_faults
+      - sensor.m5stack_eltek_shelf_rectifier_2_output_current
+      - binary_sensor.m5stack_eltek_shelf_rectifier_2_parked
+      - type: divider
+      - sensor.m5stack_eltek_shelf_rectifier_3_state
+      - sensor.m5stack_eltek_shelf_rectifier_3_faults
+      - sensor.m5stack_eltek_shelf_rectifier_3_output_current
+      - binary_sensor.m5stack_eltek_shelf_rectifier_3_parked
+      - type: divider
+      - sensor.m5stack_eltek_shelf_rectifier_4_state
+      - sensor.m5stack_eltek_shelf_rectifier_4_faults
+      - sensor.m5stack_eltek_shelf_rectifier_4_output_current
+      - binary_sensor.m5stack_eltek_shelf_rectifier_4_parked
+
+  - type: entities
+    title: Safety and commissioning
+    entities:
+      - switch.m5stack_eltek_shelf_observe_mode
+      - switch.m5stack_eltek_shelf_can_sniffer_enabled
+      - switch.m5stack_eltek_shelf_tx_log_enabled
+      - input_number.eltek_shelf_default_voltage_input
+      - button.m5stack_eltek_shelf_write_default_voltage_to_discovered_rectifiers
+      - button.m5stack_eltek_shelf_restart
