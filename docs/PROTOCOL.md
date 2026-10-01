@@ -349,6 +349,15 @@ Documented rules, all observed in practice:
 **Verified 2026-08-29:** shed after 30 s; rotation with the bus holding
 54.26–54.33 V throughout — no sag, no alarms, and duty genuinely swapped.
 
+**Live automatic rotation, 2026-09-21 through 2026-09-30 local time:** Home
+Assistant recorder history contains ten consecutive 24-hour three-unit
+handovers. Each transition ran the incoming unit alongside the outgoing unit
+for exactly 60 seconds (`1 → 2 → 1` active rectifiers), never reached zero
+active units, and held reported output voltage within 53.91–54.10 V in the
+four-minute observation window around each handover. All three units
+participated in the runtime-ordered sequence. See
+[`evidence/automatic-rotation-live-history.md`](../evidence/automatic-rotation-live-history.md).
+
 **Live three-rectifier cycle, 2026-09-20 local time:** three distinct serials
 were communicating on 233–238 VAC, each advertising 42.2 A available. With
 the XW forcing grid AC disqualified and the shelf limit at 15 A, the M5 started

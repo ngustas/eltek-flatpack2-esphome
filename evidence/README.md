@@ -27,6 +27,14 @@ This confirms state transitions and three-unit parking behavior. It is not a
 controlled efficiency study, high-load capacity test, or direct CAN-timestamped
 measurement.
 
+## Automatic rotation history
+
+[`automatic-rotation-live-history.md`](automatic-rotation-live-history.md)
+summarizes ten consecutive automatic handovers recovered from Home Assistant's
+recorder. It documents the 60-second make-before-break overlap, participating
+units, voltage envelope, runtime-ordering result, and the precise boundary on
+what reboot persistence is and is not established.
+
 ## Frame-level capture conclusions
 
 The retained raw captures in the private work area were reduced to these counts:

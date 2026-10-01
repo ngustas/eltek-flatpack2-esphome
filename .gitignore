@@ -18,6 +18,7 @@
 !examples/home-assistant/lovelace-eltek-shelf.yaml
 !evidence/
 !evidence/README.md
+!evidence/automatic-rotation-live-history.md
 !evidence/three-rectifier-efficiency-anonymized.csv
 
 # Never publish real ESPHome credentials.

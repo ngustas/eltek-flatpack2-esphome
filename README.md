@@ -63,14 +63,19 @@ Verified results include:
 - Addressed park/release through `0x05XXAC02`; `AC00` is a rectifier response,
   not a second command.
 - Park keepalive expiry that returns units to service if the controller stops.
-- Two-unit make-before-break rotation without bus sag or alarms.
+- Two-unit bench rotation without bus sag or alarms, followed by ten consecutive
+  automatic three-unit handovers in live Home Assistant history. Every live
+  handover used a 60-second `1 → 2 → 1` make-before-break sequence, with no
+  zero-active interval and observed output voltage of 53.91–54.10 V.
 - Three-unit transitions among 1 running / 2 parked, 3 running, and redundant
   2 running / 1 parked states.
 
 ## Important limits
 
-- The three-unit live cycle did not test automatic rotation persistence after a
-  reboot or high-load capacity.
+- Three-unit automatic rotation is verified. Serial-bound runtime restoration
+  across an actual controller reboot remains unverified: the recorded controller
+  reboots predate the current Home Assistant runtime ledger. High-load capacity
+  also remains untested.
 - During make-before-break walk-in, the broadcast-only setpoint can temporarily
   allow aggregate output above the requested shelf limit.
 - A parked rectifier still communicates; `Online` is not the same as carrying.
